@@ -2,7 +2,7 @@
   "name": "wiki-user-preview",
   "displayName": "Wiki User Preview",
   "description": "Upload the current file to a page under your wiki User namespace, save it, and preview the rendered original page in VS Code.",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "publisher": "UnauthorizedHOPE",
   "license": "MIT",
   "engines": {
