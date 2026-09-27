@@ -12,7 +12,7 @@
 
 ## 功能
 
-- **一条命令完成上传与预览**，不用切浏览器、不用手动复制粘贴。
+- **一条命令完成上传与预览**，不用切浏览器、不用手动复制粘贴；也可以用「仅写入」命令只上传、由你自己在多屏环境里刷新。
 - **目标页面可模板化**，默认每个源文件对应一个独立页面，不会互相覆盖。
 - **运行时零第三方依赖**：自带 HTTP 客户端（cookie 会话、重定向、gzip/br 解压、限流重试），不依赖 `node-fetch` / `mwbot`。
 - **登录双通道**：机器人密码走 `action=login`，主账号密码走 `action=clientlogin`（含两步验证字段交互），`auto` 模式自动选择并互相回退。
@@ -96,12 +96,24 @@ npm run package        # 产出 .vsix
 
 | 命令 | 作用 |
 |---|---|
-| `wikiUserPreview.originalPreview` | **主命令**：写入用户页 → 保存 → 打开预览。快捷键 `Ctrl+Alt+P`，只在 wikitext 语言的文件里出现 |
+| `wikiUserPreview.originalPreview` | **写入并预览**：写入用户页 → 保存 → 打开预览。快捷键 `Ctrl+Alt+P` |
+| `wikiUserPreview.writeOnly` | **仅写入**：写入用户页 → 保存，**不打开预览**。快捷键 `Ctrl+Alt+U` |
 | `wikiUserPreview.login` | 登录并显示当前账号、UID、cookie 数 |
 | `wikiUserPreview.logout` | 请求 `action=logout` 并清空本地 cookie 与缓存会话 |
 | `wikiUserPreview.setPassword` | 把密码写入系统钥匙串（按站点分别保存） |
 | `wikiUserPreview.clearPassword` | 清除钥匙串里的密码 |
 | `wikiUserPreview.showResolvedConfig` | 以 JSON 显示**实际生效**的配置（密码打码），排查"到底读了哪个配置" |
+
+两个写入命令共用同一套流程，只有最后一步不同：
+
+| | `originalPreview` | `writeOnly` |
+|---|---|---|
+| 目标页面、冲突检测、`purge`、日志 | 相同 | 相同 |
+| 打开预览 | 取决于 `openAfterSave`（默认开） | **始终不打开** |
+
+`writeOnly` 适合另一块屏幕上已经开着该页面、改完直接刷新就行的场景。它同样会执行 `action=purge`（受 `purgeAfterSave` 控制），所以刷新时不会因为边缘缓存看到旧版。完成后会弹一条带 **「在浏览器中打开」**（用的是带版本参数、绕开缓存的地址）和 **「查看页面地址」** 的提示，不点就什么都不做。
+
+在编辑器的标题栏上，`writeOnly` 是云上传图标，`originalPreview` 是预览图标，两者都在 `editorLangId == wikitext` 时出现。
 
 主命令的执行流程：
 
@@ -142,7 +154,7 @@ npm run package        # 产出 .vsix
 | `wikiUserPreview.detectConflict` | `true` | 用 PAGE_INFO 里的版本做冲突检测，冲突时询问是否强制覆盖 |
 | `wikiUserPreview.purgeAfterSave` | `true` | 写入后调 `action=purge` 刷新页面缓存 |
 | `wikiUserPreview.simpleBrowserBeside` | `true` | 让内置浏览器不与代码挤在同一编辑器组，而是出现在代码区右侧 |
-| `wikiUserPreview.openAfterSave` | `true` | 保存后自动打开预览 |
+| `wikiUserPreview.openAfterSave` | `true` | `originalPreview` 保存后是否自动打开预览；`writeOnly` 始终不打开，与本项无关 |
 | `wikiUserPreview.userAgent` | `""` | 自定义 User-Agent；被 Cloudflare 拦时可填浏览器 UA |
 | `wikiUserPreview.requestTimeout` | `30000` | 单请求超时（毫秒） |
 | `wikiUserPreview.insecureTls` | `false` | 跳过证书校验（仅自建站点自签证书时用） |

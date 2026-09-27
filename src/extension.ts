@@ -219,7 +219,17 @@ async function resolveEditBase(
 	return undefined;
 }
 
-async function writeAndPreview(context: vscode.ExtensionContext): Promise<void> {
+/**
+ * 这次写入之后要不要打开预览。
+ *
+ * - `writeOnly` 命令传 `openPreview: false`，**始终不打开**；
+ * - `originalPreview` 命令还要看 `openAfterSave` 配置。
+ */
+export function shouldOpenPreview(options: { openPreview?: boolean }, openAfterSave: boolean): boolean {
+	return (options.openPreview ?? true) && openAfterSave;
+}
+
+async function writeAndPreview(context: vscode.ExtensionContext, options: { openPreview?: boolean } = {}): Promise<void> {
 	const editor = vscode.window.activeTextEditor;
 	if (!editor) {
 		throw new Error('当前没有打开的编辑器。');
@@ -375,8 +385,24 @@ async function writeAndPreview(context: vscode.ExtensionContext): Promise<void> 
 		log(`差异：${articleUrl(cfg.articleBase, pageTitle)}?diff=${result.newrevid}&oldid=${result.oldrevid}`);
 	}
 
-	if (!cfg.openAfterSave) {
-		void vscode.window.showInformationMessage(`已保存到 ${result.title}（rev ${result.newrevid ?? '?'}）。`);
+	// 打开预览时用的地址带一个随版本变化的参数，绕开浏览器缓存 / bfcache / 边缘缓存
+	const previewUrl = withCacheBuster(url, result.newrevid ?? Date.now());
+
+	// 仅写入模式（`writeOnly` 命令，或把 openAfterSave 关掉）：不打开预览，只给反馈和
+	// 一次性的打开入口。适合另一块屏幕上已经开着页面、直接刷新就行的场景。
+	if (!shouldOpenPreview(options, cfg.openAfterSave)) {
+		log(`仅写入，不打开预览。预览 URL：${previewUrl}`);
+		const action = await vscode.window.showInformationMessage(
+			`已写入 ${result.title}（rev ${result.newrevid ?? '?'}），可直接刷新页面查看。`,
+			'在浏览器中打开',
+			'查看页面地址',
+		);
+		if (action === '在浏览器中打开') {
+			await preview.openInSystemBrowser(previewUrl);
+		} else if (action === '查看页面地址') {
+			await vscode.env.clipboard.writeText(url);
+			void vscode.window.showInformationMessage('页面地址已复制到剪贴板。');
+		}
 		return;
 	}
 
@@ -608,6 +634,10 @@ export function activate(context: vscode.ExtensionContext): void {
 
 	context.subscriptions.push(
 		vscode.commands.registerCommand('wikiUserPreview.originalPreview', run('写入并预览', writeAndPreview)),
+		vscode.commands.registerCommand(
+			'wikiUserPreview.writeOnly',
+			run('仅写入用户页', ctx => writeAndPreview(ctx, { openPreview: false })),
+		),
 		vscode.commands.registerCommand('wikiUserPreview.login', run('登录', loginCommand)),
 		vscode.commands.registerCommand('wikiUserPreview.logout', run('退出登录', logoutCommand)),
 		vscode.commands.registerCommand('wikiUserPreview.setPassword', run('设置密码', setPasswordCommand)),

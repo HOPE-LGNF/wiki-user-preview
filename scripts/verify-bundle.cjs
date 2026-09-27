@@ -105,6 +105,7 @@ check('activate() 能无异常执行', activateError === undefined, activateErro
 
 const expected = [
 	'wikiUserPreview.originalPreview',
+	'wikiUserPreview.writeOnly',
 	'wikiUserPreview.login',
 	'wikiUserPreview.logout',
 	'wikiUserPreview.setPassword',

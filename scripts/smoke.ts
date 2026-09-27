@@ -11,6 +11,7 @@ import * as https from 'node:https';
 import { WikiHttpClient, sanitizeHeaderValue } from '../src/httpClient';
 import { MediaWikiApi, MediaWikiError, ParseResult } from '../src/mediawiki';
 import { buildWebviewHtml, openInSimpleBrowser } from '../src/preview';
+import { shouldOpenPreview } from '../src/extension';
 import { applyTemplate, articleUrl, buildPageTitle, documentVars, sanitizeTitlePart, usernameFromWikiparserUser, withCacheBuster } from '../src/config';
 import { extractPageInfo, isUserNamespaceTitle, pageInfoFieldRange } from '../src/pageInfo';
 
@@ -105,6 +106,12 @@ check(
 	!/[^\t\x20-\x7e]/.test(sanitizeHeaderValue('Mozilla/5.0 (contact: HOPE的机器人) \u00e9\u4e2d')),
 	sanitizeHeaderValue('Mozilla/5.0 (contact: HOPE的机器人)'),
 );
+
+// ------- 仅写入 vs 写入并预览：这个真值表很容易写错，固定下来 -------
+eq('writeOnly 命令始终不打开预览（openAfterSave 为 true 时也是）', shouldOpenPreview({ openPreview: false }, true), false);
+eq('writeOnly 命令 + openAfterSave 关闭 → 不打开', shouldOpenPreview({ openPreview: false }, false), false);
+eq('originalPreview + openAfterSave 开启 → 打开预览', shouldOpenPreview({}, true), true);
+eq('originalPreview + openAfterSave 关闭 → 不打开预览', shouldOpenPreview({}, false), false);
 
 // -------- PAGE_INFO：wikitext 的「Pull page to edit」必然在文件开头插入这个块 --------
 // 下面的字符串按 wikitext 的 getPageCode/getInfoHead 真实格式构造：字段之间用 \r 分隔，

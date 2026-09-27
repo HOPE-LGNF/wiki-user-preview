@@ -2,7 +2,7 @@
   "name": "wiki-user-preview",
   "displayName": "Wiki User Preview",
   "description": "Upload the current file to a page under your wiki User namespace, save it, and preview the rendered original page in VS Code.",
-  "version": "0.2.4",
+  "version": "0.2.5",
   "publisher": "UnauthorizedHOPE",
   "license": "MIT",
   "engines": {
@@ -37,6 +37,12 @@
         "icon": "$(open-preview)"
       },
       {
+        "command": "wikiUserPreview.writeOnly",
+        "title": "仅写入用户页（不打开预览）",
+        "category": "Wiki User Preview",
+        "icon": "$(cloud-upload)"
+      },
+      {
         "command": "wikiUserPreview.login",
         "title": "登录（并显示当前账号）",
         "category": "Wiki User Preview"
@@ -65,6 +71,11 @@
     "menus": {
       "editor/title": [
         {
+          "command": "wikiUserPreview.writeOnly",
+          "when": "editorLangId == wikitext",
+          "group": "navigation@8"
+        },
+        {
           "command": "wikiUserPreview.originalPreview",
           "when": "editorLangId == wikitext",
           "group": "navigation@9"
@@ -73,6 +84,10 @@
       "commandPalette": [
         {
           "command": "wikiUserPreview.originalPreview",
+          "when": "editorLangId == wikitext"
+        },
+        {
+          "command": "wikiUserPreview.writeOnly",
           "when": "editorLangId == wikitext"
         },
         {
@@ -97,6 +112,12 @@
         "command": "wikiUserPreview.originalPreview",
         "key": "ctrl+alt+p",
         "mac": "cmd+alt+p",
+        "when": "editorLangId == wikitext"
+      },
+      {
+        "command": "wikiUserPreview.writeOnly",
+        "key": "ctrl+alt+u",
+        "mac": "cmd+alt+u",
         "when": "editorLangId == wikitext"
       }
     ],
@@ -239,7 +260,7 @@
         "wikiUserPreview.openAfterSave": {
           "type": "boolean",
           "default": true,
-          "markdownDescription": "保存成功后自动打开页面。"
+          "markdownDescription": "`originalPreview` 命令保存成功后是否自动打开页面。设为 `false` 等价于始终使用 `writeOnly` 命令。`writeOnly` 命令本身**始终不打开预览**，与本项无关。"
         },
         "wikiUserPreview.userAgent": {
           "type": "string",
