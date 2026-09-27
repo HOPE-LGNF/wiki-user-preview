@@ -11,12 +11,14 @@ import * as https from 'node:https';
 import { WikiHttpClient, sanitizeHeaderValue } from '../src/httpClient';
 import { MediaWikiApi, MediaWikiError, ParseResult } from '../src/mediawiki';
 import { buildWebviewHtml, openInSimpleBrowser } from '../src/preview';
-import { shouldOpenPreview } from '../src/extension';
-import { applyTemplate, articleUrl, buildPageTitle, documentVars, sanitizeTitlePart, usernameFromWikiparserUser, withCacheBuster } from '../src/config';
+import { shouldOpenPreview, writeConfirm } from '../src/extension';
+import { applyTemplate, articleUrl, buildPageTitle, documentVars, getSharedClient, resetSharedClient, resolveConfig, sanitizeTitlePart, usernameFromWikiparserUser, withCacheBuster } from '../src/config';
+import { startCollector, startFakeWiki } from './fakeWiki';
 import { extractPageInfo, isUserNamespaceTitle, pageInfoFieldRange } from '../src/pageInfo';
 
 let passed = 0;
 let failed = 0;
+let skipped = 0;
 
 function check(name: string, condition: boolean, detail?: unknown): void {
 	if (condition) {
@@ -112,6 +114,33 @@ eq('writeOnly 命令始终不打开预览（openAfterSave 为 true 时也是）'
 eq('writeOnly 命令 + openAfterSave 关闭 → 不打开', shouldOpenPreview({ openPreview: false }, false), false);
 eq('originalPreview + openAfterSave 开启 → 打开预览', shouldOpenPreview({}, true), true);
 eq('originalPreview + openAfterSave 关闭 → 不打开预览', shouldOpenPreview({}, false), false);
+
+// ------- 写入确认框的文案：按钮必须与模式一致 -------
+// v0.2.5 把按钮写死成「写入并预览」，于是「仅写入」命令弹出的确认框文案自相矛盾：
+// 用户特意选了不预览，按钮却写着「写入并预览」。
+const baseConfirm = {
+	pageTitle: 'User:Alice/OriginalPreview/Test',
+	charCount: 12,
+	host: 'w.example',
+	username: 'Alice',
+	titleSource: 'wikiUserPreview.pageTemplate',
+	summary: '摘要',
+	strippedChars: 0,
+};
+const previewDialog = writeConfirm({ ...baseConfirm, openAfterwards: true });
+eq('确认框：写入并预览模式的按钮是「写入并预览」', previewDialog.button, '写入并预览');
+check('确认框：该模式不应出现「不打开预览」的说明', !previewDialog.detail.includes('不打开预览'), previewDialog.detail);
+check('确认框：消息里带上页面名与字符数', previewDialog.message.includes(baseConfirm.pageTitle) && previewDialog.message.includes('12 字符'), previewDialog.message);
+
+const writeOnlyDialog = writeConfirm({ ...baseConfirm, openAfterwards: false });
+eq('确认框：仅写入模式的按钮是「仅写入」', writeOnlyDialog.button, '仅写入');
+check('确认框：仅写入模式的按钮不能写成「写入并预览」', writeOnlyDialog.button !== '写入并预览', writeOnlyDialog.button);
+check('确认框：仅写入模式在明细里说明这次不开预览', writeOnlyDialog.detail.includes('本次只写入，不打开预览'), writeOnlyDialog.detail);
+check('确认框：两种模式的按钮不同', writeOnlyDialog.button !== previewDialog.button);
+
+const strippedDialog = writeConfirm({ ...baseConfirm, openAfterwards: true, strippedChars: 42 });
+check('确认框：剥离了 PAGE_INFO 时在明细里说明', strippedDialog.detail.includes('42 字符不会上传'), strippedDialog.detail);
+check('确认框：没有剥离时不出现该说明', !previewDialog.detail.includes('PAGE_INFO'), previewDialog.detail);
 
 // -------- PAGE_INFO：wikitext 的「Pull page to edit」必然在文件开头插入这个块 --------
 // 下面的字符串按 wikitext 的 getPageCode/getInfoHead 真实格式构造：字段之间用 \r 分隔，
@@ -312,11 +341,8 @@ async function main(): Promise<void> {
 	console.log('\n[2] 对 www.mediawiki.org 的真实调用');
 
 	const client = new WikiHttpClient(ua, 30000, false);
-
-	const apiPath = await probe(client);
-	check('apiPath 探测命中', apiPath !== undefined, apiPath);
-	// mediawiki.org 的 api 在 /w/api.php
-	eq('mediawiki.org 使用 /w/api.php', apiPath, '/w/api.php');
+	// 客户端只与一个主机通信，使用前必须先声明是哪一个
+	client.setHost('www.mediawiki.org', 'https://');
 
 	// ---------------------------------------------------------------
 	// 回归：真实用户报告 "Invalid character in header content [\"User-Agent\"]"。
@@ -333,52 +359,88 @@ async function main(): Promise<void> {
 	}
 	check('复现原 bug：未经净化的中文 UA 会被 Node 直接拒绝', rawRejected);
 
-	const tolerant = new WikiHttpClient(rawUa, 30000, false);
-	const tolerantResponse = await politeRequest(
-		tolerant,
-		`${ORIGIN}${apiPath ?? '/w/api.php'}`,
-		{ query: { action: 'query', meta: 'siteinfo', siprop: 'general', format: 'json' } },
-		'中文 UA 请求',
-	);
-	check('修复后：WikiHttpClient 自动净化，同样的 UA 请求成功', tolerantResponse.status === 200, tolerantResponse.status);
-
-	const api = new MediaWikiApi(client, `${ORIGIN}${apiPath ?? '/w/api.php'}`, message => console.log(`    … ${message}`));
-
-	await sleep(600);
-	const logintoken = await api.getToken('login');
-	check('拿到 login token', typeof logintoken === 'string' && logintoken.length > 10, logintoken.slice(0, 12));
-	check('cookie jar 已种下 token cookie', client.cookieCount > 0, client.cookieCount);
-
-	await sleep(600);
-	const csrf = await api.getToken('csrf');
-	check('匿名也能拿到 csrf token（形如 +\\）', csrf.length > 0, csrf);
-
-	await sleep(600);
-	const info = await api.getUserInfo();
-	check('匿名状态下 userinfo.anonymous === true', info.anonymous === true, info);
-
-	await sleep(600);
-	const revision = await api.getPageRevision('Project:Sandbox');
-	check('查询到 Project:Sandbox 的 revid', typeof revision?.revid === 'number', revision);
-
-	// oldid：把预览钉死在指定版本上——这是"页面更新了但预览还是旧版"的根治手段
-	if (revision?.revid !== undefined) {
-		await sleep(600);
-		const pinned = await api.parsePage('Project:Sandbox', { getCss: false, revid: revision.revid });
-		eq('parsePage(revid) 返回的 revid 等于请求的 oldid', pinned.revid, revision.revid);
-		check('parsePage(revid) 也拿到了正文', pinned.text.length > 50, pinned.text.length);
+	// 先确认目标站点可达再跑联网检查。网络不可达时整段跳过并说明原因——
+	// 否则环境问题会伪装成代码失败（本机就出现过 Node 访问 mediawiki.org 超时、curl 却是 200）。
+	let reachable = true;
+	try {
+		await client.request(`${ORIGIN}/w/api.php`, { query: { action: 'query', meta: 'siteinfo', format: 'json' } });
+	} catch (error) {
+		reachable = false;
+		skipped += 1;
+		console.log(`  ⚠ 跳过联网检查：${error instanceof Error ? error.message : String(error)}`);
+		console.log('    这一段的结论只反映网络可达性，不反映代码正确性。');
+		if (process.env.WIKI_USER_PREVIEW_REQUIRE_NETWORK) {
+			failed += 1;
+			console.log('    （已设 WIKI_USER_PREVIEW_REQUIRE_NETWORK，按失败处理）');
+		}
 	}
 
-	await sleep(600);
-	const parsed = await api.parsePage('Project:Sandbox', { getCss: false });
-	check('action=parse 返回 HTML', parsed.text.length > 50, parsed.text.length);
-	check('parse 返回标题', parsed.title === 'Project:Sandbox', parsed.title);
+	if (reachable) {
+		const apiPath = await probe(client);
+		check('apiPath 探测命中', apiPath !== undefined, apiPath);
+		// mediawiki.org 的 api 在 /w/api.php
+		eq('mediawiki.org 使用 /w/api.php', apiPath, '/w/api.php');
 
-	await sleep(600);
-	const withCss = await api.parsePage('Project:Sandbox', { getCss: true });
-	check('getCss=true 时拿到 headhtml', typeof withCss.headHtml === 'string' && withCss.headHtml.length > 0, withCss.headHtml?.length);
 
-	// ------------------------------------------------ 3. 预览 HTML 的产出
+		const tolerant = new WikiHttpClient(rawUa, 30000, false);
+		tolerant.setHost('www.mediawiki.org', 'https://');
+		const tolerantResponse = await politeRequest(
+			tolerant,
+			`${ORIGIN}${apiPath ?? '/w/api.php'}`,
+			{ query: { action: 'query', meta: 'siteinfo', siprop: 'general', format: 'json' } },
+			'中文 UA 请求',
+		);
+		check('修复后：WikiHttpClient 自动净化，同样的 UA 请求成功', tolerantResponse.status === 200, tolerantResponse.status);
+
+		const api = new MediaWikiApi(client, `${ORIGIN}${apiPath ?? '/w/api.php'}`, message => console.log(`    … ${message}`));
+
+		await sleep(600);
+		const logintoken = await api.getToken('login');
+		check('拿到 login token', typeof logintoken === 'string' && logintoken.length > 10, logintoken.slice(0, 12));
+		check('cookie jar 已种下 token cookie', client.cookieCount > 0, client.cookieCount);
+
+		await sleep(600);
+		const csrf = await api.getToken('csrf');
+		check('匿名也能拿到 csrf token（形如 +\\）', csrf.length > 0, csrf);
+
+		await sleep(600);
+		const info = await api.getUserInfo();
+		check('匿名状态下 userinfo.anonymous === true', info.anonymous === true, info);
+
+		await sleep(600);
+		const revision = await api.getPageRevision('Project:Sandbox');
+		check('查询到 Project:Sandbox 的 revid', typeof revision?.revid === 'number', revision);
+
+		// oldid：把预览钉死在指定版本上——这是"页面更新了但预览还是旧版"的根治手段
+		if (revision?.revid !== undefined) {
+			await sleep(600);
+			const pinned = await api.parsePage('Project:Sandbox', { getCss: false, revid: revision.revid });
+			eq('parsePage(revid) 返回的 revid 等于请求的 oldid', pinned.revid, revision.revid);
+			check('parsePage(revid) 也拿到了正文', pinned.text.length > 50, pinned.text.length);
+		}
+
+		await sleep(600);
+		const parsed = await api.parsePage('Project:Sandbox', { getCss: false });
+		check('action=parse 返回 HTML', parsed.text.length > 50, parsed.text.length);
+		check('parse 返回标题', parsed.title === 'Project:Sandbox', parsed.title);
+
+		await sleep(600);
+		const withCss = await api.parsePage('Project:Sandbox', { getCss: true });
+		check('getCss=true 时拿到 headhtml', typeof withCss.headHtml === 'string' && withCss.headHtml.length > 0, withCss.headHtml?.length);
+
+		// 错误映射：不存在的页面在 parse 时应当抛 MediaWikiError
+		let threw: unknown;
+		try {
+			await sleep(600);
+			await api.parsePage('This page surely does not exist 8f3a9b2c1d', { getCss: false });
+		} catch (error) {
+			threw = error;
+		}
+		check('不存在的页面抛出 MediaWikiError', threw instanceof MediaWikiError, threw instanceof Error ? threw.message : threw);
+		check('错误码为 missingtitle', threw instanceof MediaWikiError && threw.code === 'missingtitle', threw instanceof MediaWikiError ? threw.code : undefined);
+		// ------------------------------------------------ 3. 预览 HTML 的产出
+	}
+
 	console.log('\n[3] 预览 HTML 生成与脚本剥离');
 
 	const hostile: ParseResult = {
@@ -401,32 +463,193 @@ async function main(): Promise<void> {
 	check('enableScripts=true 时 CSP 绑定同一 nonce', withScripts.html.includes(`script-src 'nonce-${withScripts.scriptNonce}'`));
 	check('站点脚本依然被剥离', (withScripts.html.match(/<script/gi) ?? []).length === 1, (withScripts.html.match(/<script/gi) ?? []).length);
 
-	// 错误映射：不存在的页面在 parse 时应当抛 MediaWikiError
-	let threw: unknown;
-	try {
-		await sleep(600);
-		await api.parsePage('This page surely does not exist 8f3a9b2c1d', { getCss: false });
-	} catch (error) {
-		threw = error;
-	}
-	check('不存在的页面抛出 MediaWikiError', threw instanceof MediaWikiError, threw instanceof Error ? threw.message : threw);
-	check('错误码为 missingtitle', threw instanceof MediaWikiError && threw.code === 'missingtitle', threw instanceof MediaWikiError ? threw.code : undefined);
+	// 登录失败与编辑报错的映射改由本地假站点覆盖（见 [4]），
+	// 这里不再向真实站点发起任何登录尝试——那是写操作，且会在对方日志里留下失败记录。
 
-	// 故意用错误的机器人密码登录，验证失败路径不会崩、且错误信息可读
+	// ============ [4] 离线安全与会话回归（本地假 MediaWiki，全程不联网）============
+	console.log('\n[4] 离线安全与会话回归（本地假 MediaWiki）');
+
+	const fakeContext = {
+		extension: { packageJSON: { version: '0.0.0-test' } },
+		secrets: { get: async () => 'fake-password', store: async () => undefined, delete: async () => undefined },
+	} as unknown as Parameters<typeof resolveConfig>[0];
+
+	async function tryResolve(site: string, apiPath: string, articlePath: string): Promise<unknown> {
+		stub.__set('wikiUserPreview', 'site', site);
+		stub.__set('wikiUserPreview', 'apiPath', apiPath);
+		stub.__set('wikiUserPreview', 'articlePath', articlePath);
+		stub.__set('wikiUserPreview', 'username', 'Alice');
+		stub.__set('wikiUserPreview', 'useWikitextSettings', false);
+		try {
+			await resolveConfig(fakeContext, { promptForSecrets: false });
+			return undefined;
+		} catch (error) {
+			return error;
+		}
+	}
+
+	// F1：拼接后的最终地址必须与配置的站点同源
+	const userinfoAttack = await tryResolve('good.example', '@evil.example/api.php', '/wiki/');
+	check(
+		'F1: apiPath 里的 @ 被拒绝（否则界面显示 good.example、密码却发给 evil.example）',
+		userinfoAttack instanceof Error && /userinfo/.test(userinfoAttack.message),
+		userinfoAttack instanceof Error ? userinfoAttack.message : userinfoAttack,
+	);
+	const crossOriginArticle = await tryResolve('good.example', '/api.php', 'https://evil.example/wiki/');
+	check(
+		'F1: articlePath 指向别的主机时被拒绝',
+		crossOriginArticle instanceof Error && /不一致/.test(crossOriginArticle.message),
+		crossOriginArticle instanceof Error ? crossOriginArticle.message : crossOriginArticle,
+	);
+	const healthyConfig = await tryResolve('good.example', '/api.php', '/wiki/');
+	check('F1: 正常配置不被误伤', healthyConfig === undefined, healthyConfig instanceof Error ? healthyConfig.message : healthyConfig);
+
+	// F2：跨主机跳转必须被拒绝，且凭据不得外流
+	const attacker = await startCollector('localhost');
+	const wiki = await startFakeWiki('127.0.0.1');
+	const redirectClient = new WikiHttpClient('smoke', 5000, false);
+	// 与生产代码一致：传的是含端口的 host（resolveConfig 传的就是 site.host）
+	redirectClient.setHost(new URL(wiki.origin).host, 'http://');
+	check('F2 前置：带端口的站点不会被自己的白名单挡掉', redirectClient.host === `127.0.0.1:${new URL(wiki.origin).port}`, redirectClient.host);
+	await redirectClient.request(wiki.apiUrl, { query: { action: 'query', meta: 'tokens', type: 'login' } });
+	check('F2 前置：客户端已持有会话 cookie', redirectClient.cookieCount > 0, redirectClient.cookieCount);
+
+	wiki.setRedirectOnce(`${attacker.origin}/steal`);
+	let redirectError: unknown;
+	try {
+		await redirectClient.request(wiki.apiUrl, { method: 'POST', form: { action: 'login', lgpassword: 'FAKE-PASSWORD-1234' } });
+	} catch (error) {
+		redirectError = error;
+	}
+	check(
+		'F2: 跳转到另一个主机时被拒绝',
+		redirectError instanceof Error && /已拒绝向/.test(redirectError.message),
+		redirectError instanceof Error ? redirectError.message : redirectError,
+	);
+	check('F2: 另一个主机没有收到任何请求（cookie 与密码都没外流）', attacker.received.length === 0, attacker.received);
+	eq('F2: 被拒绝后本机 cookie 仍在（没有误清）', redirectClient.cookieCount > 0, true);
+
+	// F2b：同主机跳转仍然跟随（MediaWiki 的 /api.php → /w/api.php 很常见）
+	wiki.setRedirectOnce(`${wiki.origin}/other`);
+	const followed = await redirectClient.request(wiki.apiUrl, { query: { action: 'query', meta: 'userinfo' } });
+	eq('F2b: 同主机跳转仍被跟随', followed.status, 200);
+
+	// F4：clientlogin 的 UI 续登必须符合协议
+	const wiki2 = await startFakeWiki('127.0.0.1');
+	wiki2.setClientLoginScript([
+		{
+			status: 'UI',
+			requests: [
+				{ id: 'OATHToken', type: 'password', label: '两步验证码', required: true },
+				{ id: 'loginpreservestate', type: 'hidden', value: '1' },
+			],
+		},
+		{ status: 'PASS', username: 'Alice@PreviewBot' },
+	]);
+	const client2 = new WikiHttpClient('smoke', 5000, false);
+	client2.setHost(new URL(wiki2.origin).host, 'http://');
+	const asked: { message: string; ids: string[] }[] = [];
+	const loginResult = await new MediaWikiApi(client2, wiki2.apiUrl).clientLogin('Alice@PreviewBot', 'PW', async (message, fields) => {
+		asked.push({ message, ids: fields.map(field => field.id) });
+		return { OATHToken: '987654' };
+	});
+	eq('F4: 两步验证后登录成功', loginResult.username, 'Alice@PreviewBot');
+	eq('F4: 只询问可填写的字段（hidden 不询问）', JSON.stringify(asked), JSON.stringify([{ message: '需要两步验证', ids: ['OATHToken'] }]));
+	const clientLoginCalls = wiki2.requests.filter(entry => entry.params.get('action') === 'clientlogin');
+	eq('F4: 一共两次 clientlogin 请求', clientLoginCalls.length, 2);
+	const continuation = clientLoginCalls[1]!;
+	eq('F4: 续登带 logincontinue=1（缺了它就会反复索要验证码）', continuation.params.get('logincontinue'), '1');
+	eq('F4: 续登带上验证码', continuation.params.get('OATHToken'), '987654');
+	eq('F4: 续登回传 hidden 字段', continuation.params.get('loginpreservestate'), '1');
+	check('F4: 续登不再重复发送密码', continuation.params.get('password') === null, continuation.params.get('password'));
+	check('F4: 续登不再重复发送用户名', continuation.params.get('username') === null, continuation.params.get('username'));
+
+	// F4b：RESTART 给出明确错误
+	const wiki3 = await startFakeWiki('127.0.0.1');
+	wiki3.setClientLoginScript([{ status: 'RESTART' }]);
+	const client3 = new WikiHttpClient('smoke', 5000, false);
+	client3.setHost(new URL(wiki3.origin).host, 'http://');
+	let restartError: unknown;
+	try {
+		await new MediaWikiApi(client3, wiki3.apiUrl).clientLogin('Alice', 'PW', async () => ({}));
+	} catch (error) {
+		restartError = error;
+	}
+	check(
+		'F4b: RESTART 映射为明确错误',
+		restartError instanceof MediaWikiError && restartError.code === 'clientlogin-restart',
+		restartError instanceof Error ? restartError.message : restartError,
+	);
+
+	// F11：登录失败与编辑报错的映射，全部打本地服务器
+	const wiki4 = await startFakeWiki('127.0.0.1');
+	wiki4.setLoginResult('WrongPass', 'Incorrect username or password entered');
+	const client4 = new WikiHttpClient('smoke', 5000, false);
+	client4.setHost(new URL(wiki4.origin).host, 'http://');
 	let loginError: unknown;
 	try {
-		await api.loginBotPassword('WikiUserPreviewSmokeTest@NoSuchBot', 'not-a-real-password');
+		await new MediaWikiApi(client4, wiki4.apiUrl).loginBotPassword('Alice@Bot', 'not-a-real-password');
 	} catch (error) {
 		loginError = error;
 	}
-	check('错误的机器人密码会抛出可读错误', loginError instanceof Error, loginError instanceof Error ? loginError.message : loginError);
+	check(
+		'F11: 登录失败被映射为可读错误（不再打真实站点）',
+		loginError instanceof MediaWikiError && loginError.code === 'WrongPass' && /Incorrect username/.test(loginError.info),
+		loginError instanceof Error ? loginError.message : loginError,
+	);
+
+	// F6：登出必须带会话 cookie，并清空本地 cookie
+	wiki4.setLoginResult('Success');
+	await new MediaWikiApi(client4, wiki4.apiUrl).loginBotPassword('Alice@Bot', 'pw');
+	check('F6 前置：登录后持有 cookie', client4.cookieCount > 0, client4.cookieCount);
+	await new MediaWikiApi(client4, wiki4.apiUrl).logout();
+	const logoutCall = wiki4.requests.find(entry => entry.params.get('action') === 'logout');
+	check('F6: 登出请求带上了会话 cookie（否则服务端不会注销）', Boolean(logoutCall?.cookie), logoutCall);
+	eq('F6: 登出后本地 cookie 被清空', client4.cookieCount, 0);
+
+	// F8：CSP 必须放行自己注入的 <base>
+	const rendered = buildWebviewHtml(
+		{ title: 'T', text: '<p>x</p>' },
+		{ enableScripts: false, getCss: false, articleBase: 'https://www.huijiwiki.com/wiki/' },
+	);
+	check('F8: CSP 放行站点 origin 作为 base-uri', rendered.html.includes('base-uri https://www.huijiwiki.com'), rendered.html.match(/base-uri [^;']*/)?.[0]);
+	check('F8: base-uri 不再是 none', !rendered.html.includes(`base-uri 'none'`));
+	check('F8: <base> 仍然被注入', rendered.html.includes('<base href="https://www.huijiwiki.com/wiki/" />'));
+
+	// F9：只有文件开头的 PAGE_INFO 才算元信息
+	const midFile = '正文第一行\n\n<%-- [PAGE_INFO]\n    pageTitle = #攻击者指定的页面#\n[END_PAGE_INFO] --%>\n\n更多正文\n';
+	const midParsed = extractPageInfo(midFile);
+	check('F9: 正文中间的 PAGE_INFO 不被剥离', midParsed.content === midFile, midParsed.content.slice(0, 20));
+	check('F9: 也不会劫持目标页面', midParsed.info === undefined, midParsed.info);
+	check('F9: 但会被标记出来以便提示用户', midParsed.misplacedBlock !== undefined, midParsed.misplacedBlock);
+	const headParsed = extractPageInfo('<%-- [PAGE_INFO]\n    pageTitle = #正常页面#\n[END_PAGE_INFO] --%>\r\r正文');
+	eq('F9: 文件开头的块照常识别', headParsed.info?.pageTitle, '正常页面');
+	eq('F9: 文件开头的块照常剥离', headParsed.content, '正文');
+
+	await wiki.close();
+	await wiki2.close();
+	await wiki3.close();
+	await wiki4.close();
+	await attacker.close();
+
+	// F7：连接相关设置一变，就必须换一个新客户端（会话随之重建）。
+	// 否则「先跳过 TLS 校验、后来关掉」不会对已建立的连接生效。
+	const clientA = getSharedClient('smoke-ua-A', 1000, false);
+	check('F7: 相同设置复用同一个客户端', getSharedClient('smoke-ua-A', 1000, false) === clientA);
+	check('F7: 超时变更 → 换新客户端', getSharedClient('smoke-ua-A', 2000, false) !== clientA);
+	const clientB = getSharedClient('smoke-ua-A', 1000, false);
+	check('F7: 关掉「跳过 TLS 校验」→ 换新客户端', getSharedClient('smoke-ua-A', 1000, true) !== clientB);
+	const clientC = getSharedClient('smoke-ua-A', 1000, true);
+	check('F7: User-Agent 变更 → 换新客户端', getSharedClient('smoke-ua-B', 1000, true) !== clientC);
+	resetSharedClient();
+	check('F7: resetSharedClient 之后不再复用', getSharedClient('smoke-ua-B', 1000, true) !== clientC);
 
 	void stub;
 }
 
 main()
 	.then(() => {
-		console.log(`\n结果：${passed} 通过，${failed} 失败`);
+		console.log(`\n结果：${passed} 通过，${failed} 失败${skipped > 0 ? `，${skipped} 段跳过（目标站点不可达）` : ''}`);
 		process.exit(failed === 0 ? 0 : 1);
 	})
 	.catch(error => {

@@ -3,6 +3,7 @@ import * as http from 'node:http';
 import { AddressInfo } from 'node:net';
 import * as vscode from 'vscode';
 import { WikiHttpClient } from '../../httpClient';
+import { startFakeWiki } from '../../../scripts/fakeWiki';
 import { MediaWikiApi } from '../../mediawiki';
 import { disposePreviewPanel, openInSimpleBrowser, openInWebview } from '../../preview';
 
@@ -102,7 +103,9 @@ suite('预览落位（真实 VS Code 环境）', () => {
 	});
 
 	test('webview 模式在与代码不同的组里打开', async () => {
-		const api = new MediaWikiApi(new WikiHttpClient('integration-test', 10000, false), `${base}/api.php`);
+		const client = new WikiHttpClient('integration-test', 10000, false);
+		client.setHost(new URL(base).host, 'http://');
+		const api = new MediaWikiApi(client, `${base}/api.php`);
 		const codeGroup = vscode.window.tabGroups.all.find(group => group.tabs.some(isTextEditorTab));
 		const codeColumn = codeGroup?.viewColumn ?? vscode.window.tabGroups.activeTabGroup.viewColumn;
 
@@ -139,7 +142,9 @@ suite('预览落位（真实 VS Code 环境）', () => {
 	});
 
 	test('站点返回的 revid 与请求不符时明确报错，而不是静默展示旧版', async () => {
-		const api = new MediaWikiApi(new WikiHttpClient('integration-test', 10000, false), `${base}/api.php`);
+		const client = new WikiHttpClient('integration-test', 10000, false);
+		client.setHost(new URL(base).host, 'http://');
+		const api = new MediaWikiApi(client, `${base}/api.php`);
 		await assert.rejects(
 			() =>
 				openInWebview(api, 'Test', {
@@ -151,5 +156,77 @@ suite('预览落位（真实 VS Code 环境）', () => {
 			/站点返回的是 rev 1/,
 			'revid 不匹配时应当抛错',
 		);
+	});
+});
+
+/** 端到端跑一遍写入流程。设置由 scripts/runIntegration.mjs 预写进隔离的用户目录。 */
+suite('写入流程（本地假 wiki，端到端）', () => {
+	let wiki: Awaited<ReturnType<typeof startFakeWiki>>;
+
+	suiteSetup(async () => {
+		const port = Number(process.env.WIKI_USER_PREVIEW_TEST_PORT);
+		assert.ok(
+			Number.isInteger(port) && port > 0,
+			'缺少 WIKI_USER_PREVIEW_TEST_PORT，应由 scripts/runIntegration.mjs 注入（它也要和预写的设置一致）',
+		);
+		wiki = await startFakeWiki('127.0.0.1', port);
+		wiki.setCanonicalUsername('Alice');
+		// 模拟私有 wiki：不带会话 cookie 读不到页面
+		wiki.setRequireLoginForRead(true);
+	});
+
+	suiteTeardown(async () => {
+		await wiki.close();
+	});
+
+	test('测试装置：预写的设置已生效（否则下面会弹模态框卡到超时）', async () => {
+		const own = vscode.workspace.getConfiguration('wikiUserPreview');
+		const wt = vscode.workspace.getConfiguration('wikitext');
+		assert.strictEqual(own.get('confirmBeforeSave'), false, 'confirmBeforeSave 没读到，端到端测试会被模态确认框卡住');
+		assert.strictEqual(own.get('pageTemplate'), 'User:{username}/OriginalPreview/Test', 'pageTemplate 没读到');
+		assert.strictEqual(wt.get('host'), `127.0.0.1:${process.env.WIKI_USER_PREVIEW_TEST_PORT}`, 'wikitext.host 没读到');
+		assert.ok(wt.get('password'), 'wikitext.password 没读到，会弹密码输入框');
+	});
+
+	test('机器人密码写入账号本人的用户子页，且预览复用同一登录态', async () => {
+		const doc = await vscode.workspace.openTextDocument({ content: '== 测试 ==\n正文\n', language: 'wikitext' });
+		await vscode.window.showTextDocument(doc, { viewColumn: vscode.ViewColumn.One, preview: false });
+
+		// 不直接 await：万一命令卡住，我们要能看到它到底打出了哪些请求、卡在哪一步
+		const started = Date.now();
+		let outcome = 'timeout';
+		const running = vscode.commands.executeCommand('wikiUserPreview.originalPreview').then(
+			() => 'resolved',
+			(error: unknown) => `rejected: ${error instanceof Error ? error.message : String(error)}`,
+		);
+		for (let second = 1; second <= 60 && outcome === 'timeout'; second++) {
+			outcome = await Promise.race([running, sleep(1000).then(() => 'timeout')]);
+			if (second % 10 === 0 || outcome !== 'timeout') {
+				console.log(`    · ${second}s：结果=${outcome}，已收到 ${wiki.requests.length} 个请求，标签数=${vscode.window.tabGroups.all.length}`);
+			}
+		}
+		const trace = wiki.requests.map(entry => `${entry.method} ${entry.params.get('action')}`).join(', ');
+		console.log(`    · 命令结果 = ${outcome}，耗时 ${Date.now() - started}ms`);
+		console.log(`    · 假站点收到 = ${trace || '(什么都没收到)'}`);
+		assert.notStrictEqual(outcome, 'timeout', `命令没有返回；假站点收到：${trace}`);
+
+		const found = (action: string) => wiki.requests.filter(entry => entry.params.get('action') === action);
+		const actions = trace;
+		const login = found('login')[0];
+		assert.ok(login, `应当先登录，实际发生：${actions}`);
+		assert.strictEqual(login.params.get('lgname'), 'Alice@PreviewBot', '机器人密码的登录名应带 @机器人名');
+
+		const edit = found('edit')[0];
+		assert.ok(edit, `应当发生一次 action=edit，实际发生：${actions}`);
+		assert.strictEqual(
+			edit.params.get('title'),
+			'User:Alice/OriginalPreview/Test',
+			'目标页面必须用服务端确认的账号名（Alice），而不是登录名（Alice@PreviewBot）',
+		);
+		assert.strictEqual(edit.params.get('assert'), 'user', '编辑应带 assert=user');
+
+		const parse = found('parse')[0];
+		assert.ok(parse, '保存后应发生一次 action=parse 用于预览');
+		assert.ok(parse.cookie, '预览必须复用已登录的客户端——私有 wiki 下没有 cookie 就读不到页面');
 	});
 });

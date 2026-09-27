@@ -38,6 +38,11 @@ export interface ExtractedContent {
 	info?: PageInfo;
 	/** PAGE_INFO 块在原文中的绝对范围，用于回写 revisionID */
 	block?: { start: number; end: number };
+	/**
+	 * 出现在正文中间、因此**未被识别**的同形块。
+	 * 只用于提示用户，内容原样保留——否则正文里贴的格式示例会被静默删掉。
+	 */
+	misplacedBlock?: { start: number; end: number };
 }
 
 function parseFields(body: string): PageInfo {
@@ -80,16 +85,22 @@ export function extractPageInfo(raw: string): ExtractedContent {
 		return { content: raw };
 	}
 
-	const info = parseFields(match[2] ?? '');
-	let content = raw.slice(0, match.index) + raw.slice(match.index + match[0].length);
+	const block = { start: match.index, end: match.index + match[0].length };
 
-	// 块一定在文件开头（getPageCode 写的是 infoHead + "\r\r" + 正文），
-	// 所以顺手把剥掉之后残留的空行去掉，免得上传后在页面顶部留一段空白。
-	if (!raw.slice(0, match.index).trim()) {
-		content = content.replace(/^(?:[ \t]*\r?\n|[ \t]*\r)+/, '');
+	// 只认「文件开头」的块。getPageCode 写的是 infoHead + "\r\r" + 正文，所以真实来源
+	// 一定在开头；正文中间出现的同形块（最典型的是文档里贴的格式示例）必须原样保留——
+	// 否则既会删掉正文，其中的 pageTitle 还会把上传目标劫持到别的页面。
+	if (raw.slice(0, match.index).trim() !== '') {
+		return { content: raw, misplacedBlock: block };
 	}
 
-	return { content, info, block: { start: match.index, end: match.index + match[0].length } };
+	const info = parseFields(match[2] ?? '');
+	let content = raw.slice(0, match.index) + raw.slice(block.end);
+
+	// 块后跟着 getPageCode 写入的空行，剥掉之后不要把它带上站
+	content = content.replace(/^(?:[ \t]*\r?\n|[ \t]*\r)+/, '');
+
+	return { content, info, block };
 }
 
 /**

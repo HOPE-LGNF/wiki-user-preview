@@ -85,16 +85,59 @@ export function sanitizeHeaderValue(value: string): string {
  * 极简 HTTP 客户端：手工维护 cookie jar 并跟随重定向。
  * 不依赖 fetch 的原因：Node 内置 fetch 不会保存 cookie，而 MediaWiki 的登录态完全靠 cookie 维持。
  * 不依赖第三方库的原因：扩展宿主里越少依赖越不容易在打包/远程场景出问题。
+ *
+ * **只与一个主机通信。** `allowedHost` 之外的目标一律拒绝，包括重定向目标——
+ * 否则站点只要回一个 307，就能把会话 cookie 和登录表单（或待上传正文）转交给另一个主机。
+ * 同理，cookie jar 也只服务这一个主机。
  */
 export class WikiHttpClient {
 	/** name -> value。只服务单站点，不需要按 domain 分桶。 */
 	private readonly cookies = new Map<string, string>();
+
+	/** 允许通信的主机（小写、不含端口）与协议。未设置时拒绝任何请求。 */
+	private allowedHost?: string;
+	private allowedScheme?: string;
 
 	constructor(
 		private readonly userAgent: string,
 		private readonly timeoutMs: number,
 		private readonly insecureTls: boolean,
 	) {}
+
+	/**
+	 * 设定唯一允许通信的主机（以及配置时的协议）。换主机时清空 cookie jar——
+	 * 否则上一个站点的会话 cookie 会被带到新站点去。
+	 */
+	setHost(host: string, scheme?: string): void {
+		// scheme 可能传成 'https://' / 'https:' / 'https'，统一成 'https:' 形式。
+		// 注意不能用 replace(/:+$/, '')——对 'https://' 它什么也去不掉。
+		const bareScheme = scheme?.trim().replace(/\/+$/, '').split(':')[0];
+		const normalisedScheme = bareScheme ? `${bareScheme.toLowerCase()}:` : undefined;
+
+		// 必须与 URL.host 口径一致：走一遍 URL 解析，默认端口会被去掉、显式端口会保留
+		// （'127.0.0.1:8080' 要保持带端口，而 'wiki.example:443' + https 会归一成
+		// 'wiki.example'）。否则和 assertAllowed 里的 target.host 比对时必然对不上，
+		// 任何使用非默认端口的站点都会被自己的白名单挡掉。
+		let normalisedHost = host.trim().toLowerCase();
+		if (normalisedScheme) {
+			try {
+				normalisedHost = new URL(`${normalisedScheme}//${normalisedHost}`).host.toLowerCase();
+			} catch {
+				// 解析不了就按原样比较，后面 assertAllowed 会给出明确错误
+			}
+		}
+
+		if (this.allowedHost === normalisedHost && this.allowedScheme === normalisedScheme) {
+			return;
+		}
+		this.cookies.clear();
+		this.allowedHost = normalisedHost;
+		this.allowedScheme = normalisedScheme;
+	}
+
+	get host(): string | undefined {
+		return this.allowedHost;
+	}
 
 	get cookieHeader(): string | undefined {
 		if (this.cookies.size === 0) {
@@ -109,6 +152,27 @@ export class WikiHttpClient {
 
 	clearCookies(): void {
 		this.cookies.clear();
+	}
+
+	/**
+	 * 请求前的最后一道闸：主机必须是唯一被授权的那个，且不允许 https→http 降级。
+	 * 抛错发生在建立连接之前，所以 Cookie、密码表单和待上传正文都不会被发出去。
+	 * 同主机的 http→https 升级（MediaWiki 常见）仍然允许。
+	 */
+	private assertAllowed(target: URL): void {
+		if (!this.allowedHost) {
+			throw new Error('内部错误：尚未为该客户端设定允许通信的主机');
+		}
+		const hostname = target.host.toLowerCase();
+		if (hostname !== this.allowedHost) {
+			throw new Error(
+				`出于凭据安全，已拒绝向 ${hostname} 发送请求——本客户端只被授权与 ${this.allowedHost} 通信。` +
+					`常见原因：站点配置里的 apiPath / articlePath 指向了别的主机，或站点把请求重定向到了别的主机。`,
+			);
+		}
+		if (this.allowedScheme === 'https:' && target.protocol === 'http:') {
+			throw new Error(`出于凭据安全，已拒绝从 https 降级到 http 的请求（${target.host}）。`);
+		}
 	}
 
 	private captureCookies(raw: string[] | undefined): void {
@@ -136,6 +200,15 @@ export class WikiHttpClient {
 		payload: string | undefined,
 		redirectsLeft: number,
 	): Promise<HttpResponse> {
+		// 这里是唯一的出口：首次请求和每一次重定向都经过它，所以主机白名单无法被绕过。
+		// 校验在建立连接之前完成，Cookie / 密码表单 / 待上传正文都不会离开本机。
+		// 注意要返回 rejected promise 而不是同步抛出——重定向是在 'end' 回调里发起的，
+		// 在那里同步抛错会变成未捕获异常。
+		try {
+			this.assertAllowed(target);
+		} catch (error) {
+			return Promise.reject(error);
+		}
 		return new Promise<HttpResponse>((resolve, reject) => {
 			const transport = target.protocol === 'https:' ? https : http;
 			const request = transport.request(

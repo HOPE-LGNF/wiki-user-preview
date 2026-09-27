@@ -9,6 +9,9 @@ type Section = string | undefined;
 
 const store = new Map<string, unknown>();
 
+type ConfigChangeListener = (event: { affectsConfiguration(section: string): boolean }) => unknown;
+const configChangeListeners: ConfigChangeListener[] = [];
+
 export const workspace = {
 	getConfiguration(section?: Section) {
 		return {
@@ -17,6 +20,10 @@ export const workspace = {
 				return store.has(full) ? (store.get(full) as T) : fallback;
 			},
 		};
+	},
+	onDidChangeConfiguration(listener: ConfigChangeListener) {
+		configChangeListeners.push(listener);
+		return { dispose: () => undefined };
 	},
 };
 
@@ -127,6 +134,13 @@ export const EventEmitter = class {} as unknown;
 
 export function __set(section: string | undefined, key: string, value: unknown): void {
 	store.set(`${section ?? ''}.${key}`, value);
+}
+
+/** 触发已注册的配置变更监听器，参数是「被影响到的配置节」。 */
+export function __fireConfigChange(...affected: string[]): void {
+	for (const listener of configChangeListeners) {
+		listener({ affectsConfiguration: (section: string) => affected.includes(section) });
+	}
 }
 
 export function __calls(): RecordedCall[] {

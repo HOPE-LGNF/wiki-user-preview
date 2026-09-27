@@ -156,6 +156,56 @@ function normaliseArticlePath(raw: string): string {
 	return value;
 }
 
+/** 配置里只允许出现「路径」的部分，不允许夹带协议或主机。 */
+function assertPathLike(label: string, value: string): void {
+	if (!value) {
+		return;
+	}
+	if (/^[a-z][a-z0-9+.-]*:/i.test(value) || value.startsWith('//')) {
+		throw new Error(`${label} 只能是路径（例如 /api.php），不能包含协议或主机，已拒绝：${value}`);
+	}
+}
+
+/**
+ * 拼接出的最终地址必须与配置的站点同源。
+ *
+ * 这是凭据的边界：`apiPath` 里塞一个 `@` 就能改变 URL 的实际主机
+ * （`https://good.example` + `@evil.example/api.php` → 主机是 `evil.example`），
+ * 于是界面和确认框显示 `good.example`，密码却发给了 `evil.example`。
+ */
+function assertTrustedUrl(label: string, url: string, site: SiteBase): URL {
+	let parsed: URL;
+	try {
+		parsed = new URL(url);
+	} catch {
+		throw new Error(`${label} 不是合法的绝对地址，已拒绝：${url}`);
+	}
+	if (parsed.username || parsed.password) {
+		throw new Error(
+			`${label} 含有 userinfo（"@" 之前的部分），这会把请求指向另一个主机，已拒绝：${url}。` +
+				`请检查 wikiUserPreview.apiPath / articlePath 是否被人为加入 "@"。`,
+		);
+	}
+	// 用同样的拼接方式算出「期望的基准」再比 host / protocol —— 手写 scheme 归一化很容易出错
+	// （site.scheme 存的是 'https://' 这种带 '//' 的形式，`replace(/:+$/,'')` 对它无效）。
+	let expected: URL;
+	try {
+		expected = new URL(`${site.scheme}${site.host}`);
+	} catch {
+		throw new Error(`配置的站点地址无法解析，已拒绝：${site.scheme}${site.host}`);
+	}
+	if (parsed.host.toLowerCase() !== expected.host.toLowerCase()) {
+		throw new Error(
+			`${label} 的主机是 ${parsed.host}，与配置的站点 ${expected.host} 不一致，已拒绝——密码只会发送给配置的站点。` +
+				`请检查 wikiUserPreview.site 与 apiPath / articlePath（以及 wikitext.host / wikiparser.articlePath）。`,
+		);
+	}
+	if (parsed.protocol !== expected.protocol) {
+		throw new Error(`${label} 的协议是 ${parsed.protocol}，与配置的 ${expected.protocol} 不一致，已拒绝：${url}`);
+	}
+	return parsed;
+}
+
 async function probeApiPath(client: WikiHttpClient, scheme: string, host: string): Promise<{ apiPath: string; articlePath: string } | undefined> {
 	for (const candidate of ['/api.php', '/w/api.php']) {
 		try {
@@ -182,6 +232,10 @@ async function probeApiPath(client: WikiHttpClient, scheme: string, host: string
 	return undefined;
 }
 
+function wikiparser(section: string): string {
+	return str(vscode.workspace.getConfiguration('wikiparser').get(section));
+}
+
 function resolveSiteBase(): SiteBase | undefined {
 	const explicit = str(own().get('site'));
 	if (explicit) {
@@ -191,7 +245,7 @@ function resolveSiteBase(): SiteBase | undefined {
 				scheme: parsed.scheme,
 				host: parsed.host,
 				apiPath: str(own().get('apiPath')),
-				articlePath: str(own().get('articlePath')),
+				articlePath: str(own().get('articlePath')) || wikiparser('articlePath'),
 				source: 'wikiUserPreview.site',
 			};
 		}
@@ -203,7 +257,7 @@ function resolveSiteBase(): SiteBase | undefined {
 				scheme: str(wikitext().get('transferProtocol')) || 'https://',
 				host,
 				apiPath: str(own().get('apiPath')) || str(wikitext().get('apiPath')),
-				articlePath: str(own().get('articlePath')) || str(wikitext().get('articlePath')),
+				articlePath: str(own().get('articlePath')) || str(wikitext().get('articlePath')) || wikiparser('articlePath'),
 				source: 'wikitext.host',
 			};
 		}
@@ -361,6 +415,27 @@ export interface ResolveOptions {
 	promptForSecrets?: boolean;
 }
 
+let sharedClient: { key: string; client: WikiHttpClient } | undefined;
+
+/**
+ * 连接相关的设置（User-Agent / 超时 / TLS 校验）决定客户端的身份：任何一项变了就换一个
+ * 新客户端并清空 cookie。这样「关掉跳过 TLS 校验」这类变更会立刻对下一次连接生效，
+ * 而不是让已建立的会话继续沿用旧设置。会话侧靠比对客户端实例来发现这一点并重新登录。
+ */
+export function getSharedClient(userAgent: string, requestTimeout: number, insecureTls: boolean): WikiHttpClient {
+	const key = JSON.stringify({ userAgent, requestTimeout, insecureTls });
+	if (!sharedClient || sharedClient.key !== key) {
+		sharedClient = { key, client: new WikiHttpClient(userAgent, requestTimeout, insecureTls) };
+	}
+	return sharedClient.client;
+}
+
+/** 丢弃共享客户端（含其中的 cookie）。登出、以及连接设置变更时调用。 */
+export function resetSharedClient(): void {
+	sharedClient?.client.clearCookies();
+	sharedClient = undefined;
+}
+
 export async function resolveConfig(context: vscode.ExtensionContext, options: ResolveOptions = {}): Promise<WikiContext> {
 	const promptForSecrets = options.promptForSecrets !== false;
 	const version = (context.extension.packageJSON as { version?: string }).version ?? '0.1.0';
@@ -368,7 +443,7 @@ export async function resolveConfig(context: vscode.ExtensionContext, options: R
 	const userAgent = sanitizeHeaderValue(str(own().get('userAgent')) || defaultUserAgent(version));
 	const requestTimeout = own().get<number>('requestTimeout', 30000);
 	const insecureTls = own().get<boolean>('insecureTls', false);
-	const client = new WikiHttpClient(userAgent, requestTimeout, insecureTls);
+	const client = getSharedClient(userAgent, requestTimeout, insecureTls);
 
 	let site = resolveSiteBase();
 	if (!site) {
@@ -388,8 +463,13 @@ export async function resolveConfig(context: vscode.ExtensionContext, options: R
 		site = { scheme: parsed.scheme, host: parsed.host, apiPath: '', articlePath: '', source: '本次输入' };
 	}
 
+	// 在探测之前就锁定唯一允许通信的主机：之后的探测、登录、编辑、预览全都受它约束。
+	// 换主机会顺带清空 cookie jar，避免上一个站点的会话被带过去。
+	client.setHost(site.host, site.scheme);
+
 	let apiPath = site.apiPath;
 	let articlePath = site.articlePath;
+	assertPathLike('apiPath', apiPath);
 	if (!apiPath) {
 		const probed = await probeApiPath(client, site.scheme, site.host);
 		if (!probed) {
@@ -403,6 +483,12 @@ export async function resolveConfig(context: vscode.ExtensionContext, options: R
 	const base = `${site.scheme}${site.host}`;
 	const apiUrl = `${base}${apiPath}`;
 	const articleBase = /^https?:\/\//i.test(articlePath) ? articlePath : `${base}${articlePath.startsWith('/') ? '' : '/'}${articlePath}`;
+
+	// 安全边界：拼接结果的最终主机必须就是配置的站点主机。
+	// 不校验的话，`apiPath: "@evil.example/api.php"` 会让 URL 解析出 evil.example——
+	// 界面显示 good.example，密码却发给了 evil.example。
+	assertTrustedUrl('API 地址', apiUrl, site);
+	assertTrustedUrl('条目地址', articleBase, site);
 
 	const { username, source: usernameSource } = await resolveUsername(site.host, promptForSecrets);
 	const { password, source: passwordSource } = await resolvePassword(context, site.host, username, promptForSecrets);
@@ -420,7 +506,7 @@ export async function resolveConfig(context: vscode.ExtensionContext, options: R
 		pageTemplate: str(own().get('pageTemplate')) || 'User:{username}/OriginalPreview/{filename}',
 		subpage: str(own().get('subpage')),
 		summaryTemplate: str(own().get('summaryTemplate')) || '由 VS Code 扩展 Wiki User Preview 上传，源文件：{basename}',
-		previewMode: own().get<PreviewMode>('previewMode', 'simpleBrowser'),
+		previewMode: own().get<PreviewMode>('previewMode', 'webview'),
 		enableScripts: own().get<boolean>('enableScripts', false),
 		getCss: own().get<boolean>('getCss', true),
 		watchlist: own().get<string>('watchlist', 'nochange'),

@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
-import { WikiContext, applyTemplate, articleUrl, buildPageTitle, documentVars, resolveConfig, secretKey, withCacheBuster } from './config';
+import { WikiContext, applyTemplate, articleUrl, buildPageTitle, documentVars, resetSharedClient, resolveConfig, secretKey, withCacheBuster } from './config';
+import { WikiHttpClient } from './httpClient';
 import { EditResult, MediaWikiApi, MediaWikiError, LoginResult, UiField } from './mediawiki';
 import { PageInfo, extractPageInfo, isUserNamespaceTitle } from './pageInfo';
 import * as preview from './preview';
@@ -9,7 +10,12 @@ let output: vscode.OutputChannel;
 interface Session {
 	key: string;
 	api: MediaWikiApi;
+	/** 登录时提交的名字（机器人密码会带 @机器人名） */
 	username: string;
+	/** 服务端确认的账号名，用于拼 `User:` 命名空间下的目标页面 */
+	canonicalUsername: string;
+	/** 会话所属的 HTTP 客户端。客户端一换（超时/TLS/UA 变更）会话就必须重建 */
+	client: WikiHttpClient;
 }
 
 let session: Session | undefined;
@@ -28,7 +34,12 @@ interface PostedRevision {
 const postedRevisions = new Map<string, PostedRevision>();
 
 function log(message: string): void {
-	output.appendLine(`[${new Date().toISOString()}] ${message}`);
+	const line = `[${new Date().toISOString()}] ${message}`;
+	output.appendLine(line);
+	// 排障用旁路：OutputChannel 在集成测试里看不到，设了这个环境变量就同时写到 stderr。
+	if (process.env.WIKI_USER_PREVIEW_DEBUG) {
+		console.error(`[wiki-user-preview] ${line}`);
+	}
 }
 
 function describeError(error: unknown): string {
@@ -36,6 +47,26 @@ function describeError(error: unknown): string {
 		return `${error.code}: ${error.info}`;
 	}
 	return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * 弹出带按钮的通知并处理用户的选择。
+ *
+ * **绝不 await**：带按钮的通知要等用户点掉（或超时）才 resolve，await 它会让命令一直不返回，
+ * 命令是否「完成」就取决于用户有没有关掉通知。按钮回调稍后异步执行即可。
+ */
+function notify(message: string, actions: string[], onAction?: (action: string | undefined) => Promise<void> | void): void {
+	void vscode.window.showInformationMessage(message, ...actions).then(
+		async action => {
+			try {
+				await onAction?.(action);
+			} catch (error) {
+				log(`处理通知操作失败：${describeError(error)}`);
+				void vscode.window.showErrorMessage(`处理通知操作失败：${describeError(error)}`);
+			}
+		},
+		error => log(`通知处理失败：${describeError(error)}`),
+	);
 }
 
 function makeApi(wiki: WikiContext): MediaWikiApi {
@@ -93,7 +124,7 @@ async function promptUi(message: string, fields: UiField[]): Promise<Record<stri
 }
 
 async function performLogin(wiki: WikiContext): Promise<Session> {
-	const { config } = wiki;
+	const { config, client } = wiki;
 	const api = makeApi(wiki);
 
 	if (!config.password) {
@@ -120,20 +151,36 @@ async function performLogin(wiki: WikiContext): Promise<Session> {
 		secondary = undefined;
 	}
 
-	try {
-		const result = await primary();
+	const finish = async (result: LoginResult): Promise<Session> => {
 		log(`登录成功（${result.via}）：${result.username}`);
 		void vscode.window.setStatusBarMessage(`$(account) Wiki: ${result.username}`, 5000);
-		return { key: `${config.apiUrl}|${config.username}`, api, username: result.username };
+		// 取服务端确认的账号名。机器人密码的登录名形如 `Alice@PreviewBot`，但账号其实叫
+		// Alice——用它拼 `User:` 才能落在自己的用户子页下，而不是 `User:Alice@PreviewBot/...`
+		// （那属于另一个并不存在的用户）。
+		let canonical = result.username;
+		try {
+			const info = await api.getUserInfo();
+			if (info.name) {
+				canonical = info.name;
+			}
+		} catch (error) {
+			log(`获取账号名失败，回退到登录名：${describeError(error)}`);
+		}
+		if (canonical !== result.username) {
+			log(`账号名归一化：${result.username} → ${canonical}`);
+		}
+		return { key: `${config.apiUrl}|${config.username}`, api, username: result.username, canonicalUsername: canonical, client };
+	};
+
+	try {
+		return await finish(await primary());
 	} catch (error) {
 		if (!secondary) {
 			throw error;
 		}
 		log(`首选登录方式失败：${describeError(error)}；尝试备用方式`);
 		try {
-			const result = await secondary();
-			log(`登录成功（${result.via}）：${result.username}`);
-			return { key: `${config.apiUrl}|${config.username}`, api, username: result.username };
+			return await finish(await secondary());
 		} catch (secondError) {
 			throw new Error(
 				`两种登录方式都失败了。\n首选：${describeError(error)}\n备用：${describeError(secondError)}\n\n` +
@@ -146,7 +193,9 @@ async function performLogin(wiki: WikiContext): Promise<Session> {
 
 async function getSession(wiki: WikiContext): Promise<Session> {
 	const key = `${wiki.config.apiUrl}|${wiki.config.username}`;
-	if (session && session.key === key) {
+	// 会话必须属于当前的 HTTP 客户端：客户端会因超时 / TLS 校验 / UA 变更而更换，
+	// 而换客户端意味着 cookie jar 是空的，复用旧会话会导致「编辑成功、预览却未登录」。
+	if (session && session.key === key && session.client === wiki.client) {
 		try {
 			const info = await session.api.getUserInfo();
 			if (!info.anonymous) {
@@ -156,6 +205,8 @@ async function getSession(wiki: WikiContext): Promise<Session> {
 		} catch (error) {
 			log(`校验已有会话失败，重新登录：${describeError(error)}`);
 		}
+	} else if (session) {
+		log('HTTP 客户端或站点配置已变更，重建会话');
 	}
 	session = await performLogin(wiki);
 	return session;
@@ -229,6 +280,45 @@ export function shouldOpenPreview(options: { openPreview?: boolean }, openAfterS
 	return (options.openPreview ?? true) && openAfterSave;
 }
 
+export interface WriteConfirmParams {
+	openAfterwards: boolean;
+	pageTitle: string;
+	charCount: number;
+	host: string;
+	username: string;
+	titleSource: string;
+	summary: string;
+	/** 被剥掉的 PAGE_INFO 块字符数，0 表示没有 */
+	strippedChars: number;
+}
+
+/**
+ * 写入前确认框的内容。
+ *
+ * 按钮文案必须跟着模式走：`writeOnly` 命令下若仍写「写入并预览」，就与用户刚刚特意选的
+ * 「不打开预览」自相矛盾——即使点下去的行为是对的，文案本身也是在误导。
+ * 抽成纯函数是为了能直接对文案写断言（v0.2.5 就是把这里写死成了「写入并预览」）。
+ */
+export function writeConfirm(params: WriteConfirmParams): { message: string; detail: string; button: string } {
+	const detail = [
+		`站点：${params.host}`,
+		`账号：${params.username}`,
+		`页面：${params.pageTitle}（来源：${params.titleSource}）`,
+		`摘要：${params.summary}`,
+	];
+	if (!params.openAfterwards) {
+		detail.push('本次只写入，不打开预览');
+	}
+	if (params.strippedChars > 0) {
+		detail.push(`已自动剥离文件开头的 PAGE_INFO 块（${params.strippedChars} 字符不会上传）`);
+	}
+	return {
+		message: `即将把当前文件写入 ${params.pageTitle}（${params.charCount} 字符）并保存。`,
+		detail: detail.join('\n'),
+		button: params.openAfterwards ? '写入并预览' : '仅写入',
+	};
+}
+
 async function writeAndPreview(context: vscode.ExtensionContext, options: { openPreview?: boolean } = {}): Promise<void> {
 	const editor = vscode.window.activeTextEditor;
 	if (!editor) {
@@ -250,60 +340,68 @@ async function writeAndPreview(context: vscode.ExtensionContext, options: { open
 
 	const wiki = await resolveConfig(context);
 	const cfg = wiki.config;
-	const vars = documentVars(doc, cfg.username, cfg.subpage);
-	const templateTitle = buildPageTitle(cfg, vars);
-
-	const pulledTitle = pulled.info?.pageTitle?.trim();
-	let pageTitle = templateTitle;
-	let titleSource = 'wikiUserPreview.pageTemplate';
-	if (pulledTitle && cfg.targetFromPageInfo !== 'never' && (cfg.targetFromPageInfo === 'always' || isUserNamespaceTitle(pulledTitle))) {
-		pageTitle = pulledTitle;
-		titleSource = 'PAGE_INFO.pageTitle';
-	}
-	// 只有目标页面确实就是 pull 来的那一页时，PAGE_INFO 里的版本号才能当作基准。
-	const pageInfoBase = pulledTitle && pulledTitle === pageTitle ? pulled.info : undefined;
-	const cacheKey = `${doc.uri.toString()}\u0000${pageTitle}`;
-
-	const summary = applyTemplate(cfg.summaryTemplate, vars);
-	const url = articleUrl(cfg.articleBase, pageTitle);
+	const openAfterwards = shouldOpenPreview(options, cfg.openAfterSave);
 
 	log(`站点：${cfg.apiUrl}`);
-	log(`目标页面：${pageTitle}（来源：${titleSource}）`);
-	log(`条目 URL：${url}`);
 	log(`配置来源：站点=${cfg.apiUrl}，用户名=${cfg.usernameSource}，密码=${cfg.passwordSource}`);
 	if (pulled.block) {
 		log(`已剥离开头的 PAGE_INFO 块（${pulled.block.end - pulled.block.start} 字符），该块不会被上传`);
 		log(`PAGE_INFO：${JSON.stringify(pulled.info ?? {})}`);
-	} else if (pulledTitle === undefined) {
-		log('文件中没有 PAGE_INFO 块');
+	} else {
+		log('文件开头没有 PAGE_INFO 块');
+	}
+	if (pulled.misplacedBlock) {
+		log('注意：正文中间也出现了 PAGE_INFO 形状的块。按设计只在文件开头识别元信息，该块会原样上传');
 	}
 	log(`上传正文长度：${text.length} 字符（原文 ${raw.length}）`);
 
-	if (cfg.confirmBeforeSave) {
-		const notes = [
-			`站点：${cfg.host}`,
-			`账号：${cfg.username}`,
-			`页面：${pageTitle}（来源：${titleSource}）`,
-			`摘要：${summary}`,
-		];
-		if (pulled.block) {
-			notes.push(`已自动剥离文件开头的 PAGE_INFO 块（${raw.length - text.length} 字符不会上传）`);
-		}
-		const confirm = await vscode.window.showWarningMessage(
-			`即将把当前文件写入 ${pageTitle}（${text.length} 字符）并保存。`,
-			{ modal: true, detail: notes.join('\n') },
-			'写入并预览',
-		);
-		if (confirm !== '写入并预览') {
-			return;
-		}
-	}
-
-	const result = await vscode.window.withProgress(
+	// 先登录、再决定目标页面。机器人密码的登录名形如 `Alice@PreviewBot`，但账号其实叫
+	// Alice；目标页面必须用服务端确认的账号名来拼，否则会写到 `User:Alice@PreviewBot/...`
+	// ——那属于另一个并不存在的用户，而不是自己的用户子页。
+	const outcome = await vscode.window.withProgress(
 		{ location: vscode.ProgressLocation.Notification, title: 'Wiki User Preview', cancellable: false },
 		async progress => {
 			progress.report({ message: '登录中…' });
 			const current = await getSession(wiki);
+
+			const vars = documentVars(doc, current.canonicalUsername, cfg.subpage);
+			const templateTitle = buildPageTitle(cfg, vars);
+			const pulledTitle = pulled.info?.pageTitle?.trim();
+			let pageTitle = templateTitle;
+			let titleSource = 'wikiUserPreview.pageTemplate';
+			if (pulledTitle && cfg.targetFromPageInfo !== 'never' && (cfg.targetFromPageInfo === 'always' || isUserNamespaceTitle(pulledTitle))) {
+				pageTitle = pulledTitle;
+				titleSource = 'PAGE_INFO.pageTitle';
+			}
+			// 只有目标页面确实就是 pull 来的那一页时，PAGE_INFO 里的版本号才能当作基准。
+			const pageInfoBase = pulledTitle && pulledTitle === pageTitle ? pulled.info : undefined;
+			const cacheKey = `${doc.uri.toString()}\u0000${pageTitle}`;
+			const summary = applyTemplate(cfg.summaryTemplate, vars);
+			const url = articleUrl(cfg.articleBase, pageTitle);
+
+			log(
+				`账号：${current.username}` +
+					(current.canonicalUsername === current.username ? '' : `（服务端确认名：${current.canonicalUsername}）`),
+			);
+			log(`目标页面：${pageTitle}（来源：${titleSource}）`);
+			log(`条目 URL：${url}`);
+
+			if (cfg.confirmBeforeSave) {
+				const dialog = writeConfirm({
+					openAfterwards,
+					pageTitle,
+					charCount: text.length,
+					host: cfg.host,
+					username: current.canonicalUsername,
+					titleSource,
+					summary,
+					strippedChars: pulled.block ? raw.length - text.length : 0,
+				});
+				const confirm = await vscode.window.showWarningMessage(dialog.message, { modal: true, detail: dialog.detail }, dialog.button);
+				if (confirm !== dialog.button) {
+					return undefined;
+				}
+			}
 
 			progress.report({ message: '获取编辑令牌…' });
 			let csrfToken = await current.api.getToken('csrf');
@@ -368,9 +466,15 @@ async function writeAndPreview(context: vscode.ExtensionContext, options: { open
 				}
 			}
 
-			return editResult;
+			return { result: editResult, pageTitle, url, cacheKey };
 		},
 	);
+
+	if (!outcome) {
+		log('用户在确认步骤取消了写入');
+		return;
+	}
+	const { result, pageTitle, url, cacheKey } = outcome;
 
 	log(`写入成功：rev ${result.oldrevid ?? '(新建)'} → ${result.newrevid ?? '?'}`);
 	if (result.newrevid !== undefined) {
@@ -390,19 +494,16 @@ async function writeAndPreview(context: vscode.ExtensionContext, options: { open
 
 	// 仅写入模式（`writeOnly` 命令，或把 openAfterSave 关掉）：不打开预览，只给反馈和
 	// 一次性的打开入口。适合另一块屏幕上已经开着页面、直接刷新就行的场景。
-	if (!shouldOpenPreview(options, cfg.openAfterSave)) {
+	if (!openAfterwards) {
 		log(`仅写入，不打开预览。预览 URL：${previewUrl}`);
-		const action = await vscode.window.showInformationMessage(
-			`已写入 ${result.title}（rev ${result.newrevid ?? '?'}），可直接刷新页面查看。`,
-			'在浏览器中打开',
-			'查看页面地址',
-		);
-		if (action === '在浏览器中打开') {
-			await preview.openInSystemBrowser(previewUrl);
-		} else if (action === '查看页面地址') {
-			await vscode.env.clipboard.writeText(url);
-			void vscode.window.showInformationMessage('页面地址已复制到剪贴板。');
-		}
+		notify(`已写入 ${result.title}（rev ${result.newrevid ?? '?'}），可直接刷新页面查看。`, ['在浏览器中打开', '查看页面地址'], async action => {
+			if (action === '在浏览器中打开') {
+				await preview.openInSystemBrowser(previewUrl);
+			} else if (action === '查看页面地址') {
+				await vscode.env.clipboard.writeText(url);
+				void vscode.window.showInformationMessage('页面地址已复制到剪贴板。');
+			}
+		});
 		return;
 	}
 
@@ -481,40 +582,49 @@ async function openPreview(wiki: WikiContext, pageTitle: string, url: string, ne
 	} catch (error) {
 		log(`用「${PREVIEW_LABELS[mode]}」预览失败：${describeError(error)}`);
 		const others = ALL_PREVIEW_MODES.filter(item => item !== mode);
-		const fallback = await vscode.window.showErrorMessage(
-			`预览失败（${PREVIEW_LABELS[mode]}）：${describeError(error)}`,
-			...others.map(item => PREVIEW_BUTTONS[item]),
-			'查看日志',
-		);
-		const switched = others.find(item => fallback === PREVIEW_BUTTONS[item]);
-		if (switched) {
-			await renderPreview(wiki, pageTitle, previewUrl, switched, newrevid);
-		} else if (fallback === '查看日志') {
-			output.show(true);
-		}
+		// 同样不 await：交给用户之后异步处理
+		void vscode.window
+			.showErrorMessage(
+				`预览失败（${PREVIEW_LABELS[mode]}）：${describeError(error)}`,
+				...others.map(item => PREVIEW_BUTTONS[item]),
+				'查看日志',
+			)
+			.then(async fallback => {
+				try {
+					const switched = others.find(item => fallback === PREVIEW_BUTTONS[item]);
+					if (switched) {
+						await renderPreview(wiki, pageTitle, previewUrl, switched, newrevid);
+					} else if (fallback === '查看日志') {
+						output.show(true);
+					}
+				} catch (retryError) {
+					log(`改用其它方式预览也失败了：${describeError(retryError)}`);
+					void vscode.window.showErrorMessage(`改用其它方式预览也失败了：${describeError(retryError)}`);
+				}
+			});
 		return;
 	}
 
 	// 成功之后也始终给一次一键切换的机会，省得为了换个打开方式去改配置
 	const others = ALL_PREVIEW_MODES.filter(item => item !== mode);
-	const action = await vscode.window.showInformationMessage(
-		`已保存到 ${pageTitle}${revSuffix}，已用「${PREVIEW_LABELS[mode]}」打开。`,
+	notify(`已保存到 ${pageTitle}${revSuffix}，已用「${PREVIEW_LABELS[mode]}」打开。`, [
 		...others.map(item => PREVIEW_BUTTONS[item]),
 		'查看页面地址',
-	);
-	const switched = others.find(item => action === PREVIEW_BUTTONS[item]);
-	if (switched) {
-		try {
-			await renderPreview(wiki, pageTitle, previewUrl, switched, newrevid);
-		} catch (error) {
-			log(`改用「${PREVIEW_LABELS[switched]}」失败：${describeError(error)}`);
-			void vscode.window.showErrorMessage(`改用「${PREVIEW_LABELS[switched]}」失败：${describeError(error)}`);
+	], async action => {
+		const switched = others.find(item => action === PREVIEW_BUTTONS[item]);
+		if (switched) {
+			try {
+				await renderPreview(wiki, pageTitle, previewUrl, switched, newrevid);
+			} catch (error) {
+				log(`改用「${PREVIEW_LABELS[switched]}」失败：${describeError(error)}`);
+				void vscode.window.showErrorMessage(`改用「${PREVIEW_LABELS[switched]}」失败：${describeError(error)}`);
+			}
+		} else if (action === '查看页面地址') {
+			// 复制不带 cache-buster 的规范地址
+			await vscode.env.clipboard.writeText(url);
+			void vscode.window.showInformationMessage('页面地址已复制到剪贴板。');
 		}
-	} else if (action === '查看页面地址') {
-		// 复制不带 cache-buster 的规范地址
-		await vscode.env.clipboard.writeText(url);
-		void vscode.window.showInformationMessage('页面地址已复制到剪贴板。');
-	}
+	});
 }
 
 // ---------------------------------------------------------------- 诊断等
@@ -533,7 +643,7 @@ async function showResolvedConfig(context: vscode.ExtensionContext): Promise<voi
 		content: JSON.stringify(
 			{
 				说明: '这是 Wiki User Preview 实际生效的配置。密码不会显示明文。',
-				站点配置来源: 'wikiUserPreview.site / wikitext.host / wikiparser.articlePath',
+				站点配置来源: '站点：wikiUserPreview.site → wikitext.host；apiPath：wikiUserPreview.apiPath → wikitext.apiPath；articlePath：wikiUserPreview.articlePath → wikitext.articlePath → wikiparser.articlePath；用户名：wikiUserPreview.username → wikitext.userName → wikiparser.user',
 				...redacted,
 			},
 			null,
@@ -554,16 +664,25 @@ async function loginCommand(context: vscode.ExtensionContext): Promise<void> {
 	log(`userinfo: ${JSON.stringify(info)}`);
 }
 
-async function logoutCommand(context: vscode.ExtensionContext): Promise<void> {
-	const wiki = await resolveConfig(context);
-	try {
-		const api = makeApi(wiki);
-		await api.logout();
-	} catch (error) {
-		log(`登出请求失败（忽略）：${describeError(error)}`);
+async function logoutCommand(_context: vscode.ExtensionContext): Promise<void> {
+	const current = session;
+	if (!current) {
+		resetSharedClient();
+		void vscode.window.showInformationMessage('本地没有登录态；已清除缓存的客户端与 cookie。');
+		return;
 	}
-	dropSession();
-	void vscode.window.showInformationMessage('已清除本地登录态与 cookie。');
+	try {
+		// 必须用当前会话的客户端发请求：换成新客户端就没有会话 cookie 了，
+		// 服务端识别不出会话，等于没有注销。
+		await current.api.logout();
+		void vscode.window.showInformationMessage(`已注销 ${current.canonicalUsername}，并清除本地登录态与 cookie。`);
+	} catch (error) {
+		log(`登出请求失败：${describeError(error)}`);
+		void vscode.window.showWarningMessage(`服务端注销可能未成功（${describeError(error)}），但本地登录态与 cookie 已清除。`);
+	} finally {
+		dropSession();
+		resetSharedClient();
+	}
 }
 
 async function setPasswordCommand(context: vscode.ExtensionContext): Promise<void> {
@@ -643,6 +762,21 @@ export function activate(context: vscode.ExtensionContext): void {
 		vscode.commands.registerCommand('wikiUserPreview.setPassword', run('设置密码', setPasswordCommand)),
 		vscode.commands.registerCommand('wikiUserPreview.clearPassword', run('清除密码', clearPasswordCommand)),
 		vscode.commands.registerCommand('wikiUserPreview.showResolvedConfig', run('显示配置', showResolvedConfig)),
+	);
+
+	// 连接相关设置一旦变更就立刻丢弃已有客户端与会话：否则「关掉跳过 TLS 校验」这类改动
+	// 不会对已建立的会话生效，旧连接会继续沿用旧设置。
+	context.subscriptions.push(
+		vscode.workspace.onDidChangeConfiguration(event => {
+			const affected = ['insecureTls', 'requestTimeout', 'userAgent'].filter(key =>
+				event.affectsConfiguration(`wikiUserPreview.${key}`),
+			);
+			if (affected.length > 0) {
+				log(`连接相关设置已变更（${affected.join('、')}），丢弃已有客户端与会话`);
+				dropSession();
+				resetSharedClient();
+			}
+		}),
 	);
 
 	log('Wiki User Preview 已激活');

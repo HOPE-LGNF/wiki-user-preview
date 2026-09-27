@@ -139,6 +139,15 @@ function escapeHtml(input: string): string {
 	return input.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
+/** 只接受真正的绝对 URL；其余（含空串）返回 undefined。 */
+function absoluteUrl(value: string): string | undefined {
+	try {
+		return new URL(value).href;
+	} catch {
+		return undefined;
+	}
+}
+
 /** 站点自带脚本一律剥离：预览只需要渲染结果，不需要执行站点 JS。 */
 function stripScripts(html: string): string {
 	return html
@@ -179,6 +188,13 @@ pre { padding: 0.6em 0.8em; overflow-x: auto; background: var(--vscode-textCodeB
 export function buildWebviewHtml(parse: ParseResult, options: WebviewOptions): { html: string; scriptNonce: string } {
 	const n = nonce();
 	const scriptPolicy = options.enableScripts ? `'nonce-${n}'` : `'none'`;
+
+	// 站点返回的 HTML 里相对链接/图片/样式很多，必须以站点为基准解析，所以要注入 <base>。
+	// 但 CSP 的 base-uri 一旦是 'none' 就会把 <base> 整个禁掉——那样所有相对资源都会以
+	// webview 自身为基准，指向错误的位置。这里只放行这个站点的 origin。
+	const baseHref = absoluteUrl(options.articleBase);
+	const baseUri = baseHref ? new URL(baseHref).origin : "'none'";
+
 	const csp = [
 		`default-src 'none'`,
 		`img-src https: http: data: blob:`,
@@ -187,7 +203,7 @@ export function buildWebviewHtml(parse: ParseResult, options: WebviewOptions): {
 		`media-src https: http: data: blob:`,
 		`script-src ${scriptPolicy}`,
 		`frame-src https: http:`,
-		`base-uri 'none'`,
+		`base-uri ${baseUri}`,
 		`form-action 'none'`,
 	].join('; ');
 
@@ -218,7 +234,7 @@ export function buildWebviewHtml(parse: ParseResult, options: WebviewOptions): {
 <head>
 <meta charset="utf-8" />
 <meta http-equiv="Content-Security-Policy" content="${csp}" />
-<base href="${escapeHtml(options.articleBase)}" />
+${baseHref ? `<base href="${escapeHtml(baseHref)}" />` : ''}
 <title>${escapeHtml(title)}</title>
 <style>${BASE_CSS}</style>
 ${head}

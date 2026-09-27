@@ -80,6 +80,72 @@ function sleep(ms: number): Promise<void> {
 /** 429/503 时最多重试这么多次（含首次尝试）。 */
 const MAX_RATE_LIMIT_RETRIES = 4;
 
+/**
+ * 把一次 `status: UI` 响应里的字段收集成可以直接回传的键值对。
+ *
+ * - `hidden`：协议要求原样回传，不询问用户（之前被整个过滤掉，是登录反复失败的成因之一）；
+ * - `info`：只是说明文字，不回传；
+ * - `button`：按它的 name/value 回传（`logincontinue` 就是这样传的）；
+ * - 其它：交给 prompt 询问；用户取消则抛错。
+ */
+async function collectUiAnswers(fields: UiField[], message: string, prompt?: UiPrompt): Promise<Record<string, string>> {
+	const answers: Record<string, string> = {};
+	const askable: UiField[] = [];
+
+	for (const field of fields) {
+		if (!field.id) {
+			continue;
+		}
+		switch (field.type) {
+			case 'hidden':
+				if (field.value !== undefined) {
+					answers[field.id] = String(field.value);
+				}
+				break;
+			case 'info':
+				break;
+			case 'button':
+				answers[field.name ?? field.id] = String(field.value ?? '');
+				break;
+			default:
+				askable.push(field);
+				break;
+		}
+	}
+
+	if (askable.length > 0) {
+		if (!prompt) {
+			throw new MediaWikiError(
+				'clientlogin-ui-unsupported',
+				`站点要求补充登录信息（${askable.map(field => field.label ?? field.id).join('、')}），但当前环境无法交互输入。`,
+			);
+		}
+		const entered = await prompt(message, askable);
+		if (!entered) {
+			throw new Error('已取消登录。');
+		}
+		for (const field of askable) {
+			const answer = entered[field.id];
+			if (answer === undefined) {
+				continue;
+			}
+			// 复选框：勾选才提交；未勾选就整个省略该字段
+			if (field.type === 'checkbox') {
+				if (answer === 'true') {
+					answers[field.id] = '1';
+				}
+				continue;
+			}
+			answers[field.id] = answer;
+		}
+	}
+
+	if (Object.keys(answers).length === 0) {
+		throw new MediaWikiError('clientlogin-ui', `站点要求补充信息但没有给出可提交的字段：${message}`);
+	}
+	return answers;
+}
+
 export type NoticeHandler = (message: string) => void;
 
 export class MediaWikiApi {
@@ -203,9 +269,20 @@ export class MediaWikiApi {
 	 * action=clientlogin：主账号密码的唯一正规途径。
 	 * 站点可能返回 status=UI 索要额外信息（两步验证、验证码等），此时交给 prompt 回调补全。
 	 */
+	/**
+	 * action=clientlogin：主账号密码的唯一正规途径。
+	 *
+	 * 协议（见 action=help&modules=clientlogin）：拿到 `status: UI` 之后，必须**带
+	 * `logincontinue` 与相应字段**重新提交并继续判断状态；官方示例就是
+	 * `action=clientlogin&logincontinue=1&OATHToken=987654&logintoken=...`。
+	 * 不带 `logincontinue` 会一直被当成新的登录尝试，于是反复索要验证码并最终失败。
+	 *
+	 * 续登时不再重复发送 username / password —— 认证器已经持有它们，
+	 * 少发一次密码就少一处泄漏面。
+	 */
 	async clientLogin(username: string, password: string, prompt?: UiPrompt, loginReturnUrl?: string): Promise<LoginResult> {
 		const logintoken = await this.getToken('login');
-		const base: Record<string, string | undefined> = {
+		let request: Record<string, string | undefined> = {
 			action: 'clientlogin',
 			username,
 			password,
@@ -214,15 +291,14 @@ export class MediaWikiApi {
 		};
 
 		for (let round = 0; round < 6; round++) {
-			const data = await this.post(base);
+			const data = await this.post(request);
 			const clientlogin = data['clientlogin'] as
 				| { status?: string; username?: string; message?: string; messagecode?: string; requests?: UiField[] }
 				| undefined;
 			const status = clientlogin?.status ?? 'Unknown';
 
 			if (status === 'PASS') {
-				const out: LoginResult = { username: clientlogin?.username ?? username, via: 'clientlogin' };
-				return out;
+				return { username: clientlogin?.username ?? username, via: 'clientlogin' };
 			}
 			if (status === 'FAIL') {
 				throw new MediaWikiError(clientlogin?.messagecode ?? 'clientlogin-fail', `action=clientlogin 失败：${clientlogin?.message ?? '未知原因'}`);
@@ -230,35 +306,22 @@ export class MediaWikiApi {
 			if (status === 'REDIRECT') {
 				throw new MediaWikiError('clientlogin-redirect', '站点要求跳转到 Special:UserLogin 完成登录，无法在扩展内完成。请改用机器人密码。');
 			}
+			if (status === 'RESTART') {
+				throw new MediaWikiError(
+					'clientlogin-restart',
+					'站点报告认证已通过但没有关联的本地账号（RESTART），无法在扩展内完成。请先在浏览器里完成一次登录。',
+				);
+			}
 			if (status === 'UI') {
-				const requests = (clientlogin?.requests ?? []).filter(field => field.type !== 'hidden');
-				if (requests.length === 0) {
-					throw new MediaWikiError('clientlogin-ui', `站点要求补充信息但没有给出可填写的字段：${clientlogin?.message ?? ''}`);
-				}
-				if (!prompt) {
-					throw new MediaWikiError('clientlogin-ui-unsupported', `站点要求两步验证或验证码（${requests.map(r => r.label ?? r.id).join('、')}），但当前环境无法交互输入。`);
-				}
-				const answers = await prompt(clientlogin?.message ?? '需要补充登录信息', requests);
-				if (!answers) {
-					throw new Error('已取消登录。');
-				}
-				for (const field of requests) {
-					const answer = answers[field.id];
-					if (answer === undefined) {
-						continue;
-					}
-					if (field.type === 'button') {
-						base[field.name ?? field.id] = answer;
-					} else if (field.type === 'checkbox') {
-						if (answer === 'true') {
-							base[field.id] = '';
-						} else {
-							delete base[field.id];
-						}
-					} else {
-						base[field.id] = answer;
-					}
-				}
+				const fields = clientlogin?.requests ?? [];
+				const answers = await collectUiAnswers(fields, clientlogin?.message ?? '需要补充登录信息', prompt);
+				// 按协议续登：带 logincontinue，保留 logintoken，丢掉已提交的 username/password
+				request = {
+					action: 'clientlogin',
+					logincontinue: '1',
+					logintoken,
+					...answers,
+				};
 				continue;
 			}
 			throw new MediaWikiError(status, `action=clientlogin 返回了未预期的状态：${JSON.stringify(clientlogin).slice(0, 300)}`);

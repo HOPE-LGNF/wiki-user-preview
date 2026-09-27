@@ -48,6 +48,9 @@ const vscodeStub = {
 	},
 	workspace: {
 		getConfiguration: () => ({ get: (_key, fallback) => fallback }),
+		// 注意：这份内联 stub 与 scripts/vscode-stub.ts 是两份，加了新 API 要同时补。
+		// 漏了会在这里以「activate() 能无异常执行」失败的形式暴露出来。
+		onDidChangeConfiguration: () => ({ dispose: () => undefined }),
 	},
 	env: {},
 	Uri: { parse: value => value },
@@ -116,8 +119,8 @@ for (const id of expected) {
 	check(`已注册命令 ${id}`, registered.has(id));
 }
 check('注册的命令数量一致', registered.size === expected.length, registered.size);
-// activate 还会 push：1 个输出通道 + 1 个 preview 面板 disposer
-check('全部注册都进了 subscriptions（可被回收）', subscriptions.length === expected.length + 2, subscriptions.length);
+// activate 还会 push：1 个输出通道 + 1 个 preview 面板 disposer + 1 个配置变更监听
+check('全部注册都进了 subscriptions（可被回收）', subscriptions.length === expected.length + 3, subscriptions.length);
 check('输出通道写入过内容', outputLines.some(line => line.includes('激活')), outputLines.slice(0, 2));
 
 // 产物里必须真的带着两处修复所依赖的字符串常量（minify 不会删字符串字面量，

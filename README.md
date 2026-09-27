@@ -15,7 +15,9 @@
 - **一条命令完成上传与预览**，不用切浏览器、不用手动复制粘贴；也可以用「仅写入」命令只上传、由你自己在多屏环境里刷新。
 - **目标页面可模板化**，默认每个源文件对应一个独立页面，不会互相覆盖。
 - **运行时零第三方依赖**：自带 HTTP 客户端（cookie 会话、重定向、gzip/br 解压、限流重试），不依赖 `node-fetch` / `mwbot`。
-- **登录双通道**：机器人密码走 `action=login`，主账号密码走 `action=clientlogin`（含两步验证字段交互），`auto` 模式自动选择并互相回退。
+- **登录双通道**：机器人密码走 `action=login`，主账号密码走 `action=clientlogin`（含两步验证，按 MediaWiki 的 `logincontinue` 协议续登），`auto` 模式自动选择并互相回退。
+- **写入位置按服务端确认的账号名**：机器人密码的登录名是 `Alice@机器人名`，但目标页面用的是登录后由站点确认的账号名（`Alice`），所以写入的是你自己的用户子页。
+- **凭据边界明确**：密码只发送给保存它时绑定的站点，拼接后的 API/条目地址必须与配置的站点同源，HTTP 客户端只与一个主机通信、拒绝跨主机跳转。详见[凭据边界](#凭据边界)。
 - **自动处理 Wikitext 扩展的 `PAGE_INFO` 块**：上传前剥离，并用其中的 `pageTitle` / `revisionID` 决定目标页面与编辑冲突基准。
 - **三种预览方式**：Webview 自绘、VS Code 内置浏览器、系统浏览器，一键切换。
 - **密码存系统钥匙串**（`context.secrets`），不写入 `settings.json`。
@@ -60,7 +62,7 @@ npm run package        # 产出 .vsix
 | 扩展 | 本扩展如何使用它 |
 |---|---|
 | [Wikitext](https://marketplace.visualstudio.com/items?itemName=RoweWilsonFrederiskHolme.wikitext)（`RoweWilsonFrederiskHolme.wikitext`） | 读取 `wikitext.host` / `apiPath` / `articlePath` / `userName` / `password` 作为回退配置。它自身带 `wikitext.password`（**明文存 settings.json**），本扩展只在你自己填了该项时才读取。 |
-| [WikiParser Language Server](https://marketplace.visualstudio.com/items?itemName=Bhsd.vscode-extension-wikiparser)（`Bhsd.vscode-extension-wikiparser`） | 读取 `wikiparser.articlePath` 辅助站点探测；若 `wikiparser.user` 填的是用户页 URL，会从中解析出用户名。 |
+| [WikiParser Language Server](https://marketplace.visualstudio.com/items?itemName=Bhsd.vscode-extension-wikiparser)（`Bhsd.vscode-extension-wikiparser`） | 读取 `wikiparser.articlePath` 作为条目地址前缀的回退（排在 `wikitext.articlePath` 之后）；若 `wikiparser.user` 填的是用户页 URL，会从中解析出用户名。 |
 
 两点说明：
 
@@ -88,7 +90,9 @@ npm run package        # 产出 .vsix
 两者都不配也可以——第一次执行主命令时，扩展会依次弹窗询问站点、用户名、密码，并可以顺手把密码存进系统钥匙串。
 
 > **建议使用机器人密码。** 在站点上访问 `Special:BotPasswords` 创建一个，授予 *Edit existing pages* 与 *Create, edit, and move pages* 权限，会得到形如 `用户名@机器人名` 的用户名和一段一次性密码。
-> MediaWiki 官方说明：`action=login` 只为机器人密码设计；主账号密码必须走 `action=clientlogin`，账号开启两步验证时还需额外交互。本扩展两条路都实现了，`loginMode` 为 `auto`（默认）时会按用户名里有没有 `@` 自动选择并互相回退。
+> MediaWiki 官方说明：`action=login` 只为机器人密码设计；主账号密码必须走 `action=clientlogin`。本扩展两条路都实现了，`loginMode` 为 `auto`（默认）时会按用户名里有没有 `@` 自动选择并互相回退。
+>
+> 用机器人密码时，`特殊:机器人密码` 里那串 `用户名@机器人名` 是**登录名**，账号本身仍是 `用户名`。本扩展在登录成功后向站点确认真实账号名，并用它生成目标页面，所以写入的是 `User:用户名/...`，而不是 `User:用户名@机器人名/...`。
 
 ---
 
@@ -137,7 +141,7 @@ npm run package        # 产出 .vsix
 |---|---|---|
 | `wikiUserPreview.site` | `""` | 完整 URL 或裸域名。留空回退到 `wikitext.host` |
 | `wikiUserPreview.apiPath` | `""` | 留空时依次尝试 `wikitext.apiPath`、`/api.php`、`/w/api.php` 自动探测 |
-| `wikiUserPreview.articlePath` | `""` | 留空回退到 `wikitext.articlePath`，再不行用 `/wiki/` |
+| `wikiUserPreview.articlePath` | `""` | 条目地址前缀。留空依次回退 `wikitext.articlePath` → `wikiparser.articlePath` → 探测结果 → `/wiki/` |
 | `wikiUserPreview.username` | `""` | 留空依次回退 `wikitext.userName` → 从 `wikiparser.user` 解析 |
 | `wikiUserPreview.useWikitextSettings` | `true` | 是否允许继承 Wikitext 扩展的站点/账号配置 |
 | `wikiUserPreview.loginMode` | `auto` | `auto` / `botPassword` / `clientlogin` |
@@ -248,6 +252,40 @@ Webview 模式的安全处理：
 
 ---
 
+## 凭据边界
+
+预览之前会**真正把文件写到站点上**，所以「密码发给了谁」「内容写到了哪一页」比预览窗口本身更重要。扩展在这两点上做了明确限制，宁可报错也不静默继续。
+
+### 密码只发给配置的站点
+
+密码按站点域名存在系统钥匙串里（`wikiUserPreview.password.<host>`）。而请求发往的地址是由 `site` 与 `apiPath` / `articlePath` 拼出来的，所以拼接结果会被逐一校验：
+
+- 最终地址的**主机**必须与配置的站点主机一致，协议也必须一致；
+- 地址里不允许出现 userinfo（`@` 之前的部分）。少了这条，`apiPath` 填成 `@evil.example/api.php` 就会让 URL 的实际主机变成 `evil.example`——界面显示的是 A 站，密码却发给了 B 站；
+- `apiPath` 只接受路径，不接受夹带协议或主机。
+
+任一条不满足都会**在发出任何请求之前**抛错，错误信息里会写明两个主机名。
+
+### 一个客户端只与一个主机通信
+
+HTTP 客户端持有唯一被授权的主机，每次请求（包括每一次重定向）在建立连接之前都会核对：
+
+- **跨主机跳转一律拒绝**。站点回一个 307 就想把会话 cookie 和登录表单（或待上传正文）转交给别的主机——这条路是封死的；
+- 同主机跳转照常跟随（MediaWiki 的 `/api.php` → `/w/api.php`、http → https 都很常见），但禁止 https → http 降级；
+- 换站点时 cookie jar 会被清空，不会把上一个站点的会话带过去。
+
+### 会话
+
+- 编辑与预览**复用同一个已登录客户端**。私有 wiki 上如果预览另起一个匿名客户端，就会出现「保存成功、预览失败」；
+- **退出登录**用当前会话的客户端发 `action=logout`，请求带着会话 cookie，服务端会话会被真正注销，之后才清除本地 cookie；
+- User-Agent / 超时 / `insecureTls` 变更会**立即**丢弃已有客户端与会话——否则「先跳过 TLS 校验、之后关掉」不会对已建立的连接生效。
+
+### 明文密码
+
+系统钥匙串是首选。若你改用 `wikitext.password` 或 `wikiUserPreview` 侧的自定义配置，密码会以**明文**存在 `settings.json` 里——工作区级的 `settings.json` 会随仓库一起被提交，共享项目时要特别注意这一点。
+
+---
+
 ## 构建与测试
 
 ```bash
@@ -268,13 +306,19 @@ npm run test:integration # 真机集成测试（需图形界面）
 
 | 命令 | 覆盖范围 | 需要什么 |
 |---|---|---|
-| `npm run typecheck` | 类型检查 | 无 |
-| `npm run check:manifest` | `package.json` 与源码的一致性：声明的命令是否都注册了、配置项是否都真的被读取、`#xxx#` 内链是否指向存在的配置项、`main` 是否指向构建产物 | 无 |
-| `scripts/verify-bundle.cjs` | 把 `vscode` 替换成替身后**真正 require 打包产物并调用 `activate()`**，断言命令注册等 | 无 |
-| `npm run smoke` | 91 项断言：纯函数（标题模板、`PAGE_INFO` 剥离、URL 拼装、头部净化、预览 HTML 生成）+ 对真实 MediaWiki 的匿名只读调用（含 429 退避） | 联网 |
-| `npm run test:integration` | 5 项断言：在真实 VS Code 的扩展宿主里验证编辑器分组与标签落位、revid 校验 | 图形界面 + 首次会下载 VS Code |
+| `npm run typecheck` | 类型检查（`src/` 与 `scripts/` 都在内，测试脚本不过类型检查很容易掩盖错误） | 无 |
+| `npm run check:manifest` | `package.json` 与源码的一致性：声明的命令是否都注册了、配置项是否都真的被读取、`#xxx#` 内链是否指向存在的配置项、自述文件的配置表是否与 `package.json` 一致、`main` 是否指向构建产物 | 无 |
+| `scripts/verify-bundle.cjs` | 把 `vscode` 替换成替身后**真正 require 打包产物并调用 `activate()`**，断言命令注册、订阅是否都可回收 | 无 |
+| `npm run smoke` | 129 项断言。纯函数（标题模板、`PAGE_INFO` 定位、URL 拼装、头部净化、预览 HTML 与 CSP）+ **本地假 MediaWiki** 上的凭据边界、跳转限制、两步验证续登、会话与登出、主机白名单 + 对真实 MediaWiki 的匿名只读调用（含 429 退避） | 部分联网 |
+| `npm run test:integration` | 7 项断言：在真实 VS Code 的扩展宿主里验证编辑器分组与标签落位、revid 校验，以及**完整的写入流程**（用本地假 wiki 跑通登录 → 编辑 → 撤缓存 → 预览） | 图形界面 + 首次会下载 VS Code |
 
-CI（`.github/workflows/ci.yml`）只跑 `npm run verify` 与打包上传产物——`smoke` 依赖外部站点、`test:integration` 需要 GUI，都留在本地按需运行。
+CI（`.github/workflows/ci.yml`）只跑 `npm run verify` 与打包上传产物——`smoke` 里有一小段依赖外部站点、`test:integration` 需要 GUI，都留在本地按需运行。
+
+`npm run smoke` 里对真实站点的部分只有**匿名只读**调用（`action=query`）。登录失败、编辑报错这类写路径的覆盖全部打在本地假站点上，不会向第三方站点发出登录尝试。
+
+那一段联网检查会先确认目标站点可达；不可达时整段**跳过并说明原因**（计入「跳过」而不是「通过」），这样网络问题不会伪装成代码失败。需要强制要求联网时，设 `WIKI_USER_PREVIEW_REQUIRE_NETWORK=1`，跳过会按失败处理。
+
+`npm run test:integration` 会先重新构建扩展产物再启动 VS Code——否则扩展宿主加载的还是上一次的 `dist/extension.js`，测试就会在不知不觉中验证过期代码。它同时用 `--user-data-dir` 把测试实例的用户目录指到 `.vscode-test/user-data`，不会碰你日常使用的 VS Code 配置。
 
 ### 集成测试在无图形界面的 Linux 上怎么跑
 
@@ -293,10 +337,12 @@ CI（`.github/workflows/ci.yml`）只跑 `npm run verify` 与打包上传产物�
 - **Cloudflare / WAF**：灰机wiki 等站点的 `api.php` 在数据中心 IP 上可能被 Cloudflare 的人机验证拦截（返回 `403` + "请稍候…"）。浏览器直连通常没问题；必要时把 `wikiUserPreview.userAgent` 改成你浏览器的完整 UA。
 - **内置浏览器可能空白**：站点若禁止 iframe 嵌套（`X-Frame-Options` / `frame-ancestors`）就会如此，不是本扩展的问题。改用 `webview` 或 `external`。
 - **Webview 模式没有站点皮肤**：只渲染 `action=parse` 的内容 HTML，不是完整页面快照。要完整外观请用 `external`。
-- **两步验证**：`clientlogin` 走到 UI 步骤时，扩展会把站点要求的字段（如 `OATHToken`）逐个弹窗询问。图形验证码无法在扩展内完成。
+- **两步验证**：`clientlogin` 返回 `UI` 时，扩展会把站点要求的字段（如 `OATHToken`）弹窗询问，然后按 MediaWiki 协议带 `logincontinue` 续登。受限之处：纯图形验证码与第三方 OAuth 跳转（`REDIRECT`）都无法在扩展内完成，这两种情况会明确报错并建议改用机器人密码；`RESTART`（认证通过但没有本地账号）同样会明确报错。
 - **默认只写 User 命名空间**：模板可以改成任意页面，但请自行确认有编辑权限。
 - **不做后台或自动上传**：命令只在你手动触发时执行。
 - **`wikitext.password` 是明文**：这是 Wikitext 扩展的设计。本扩展优先使用系统钥匙串，只在你自己填了该项时才回退读取。
+- **`PAGE_INFO` 只在文件开头识别**：正文中间出现的同形块会被当成正文原样上传（并在日志里提示）——这样文档里贴的格式示例不会被静默删掉，其中的 `pageTitle` 也无法劫持目标页面。反过来说，如果你把块挪离了文件开头，它就不会再被剥离。
+- **配置里的“路径”必须是路径**：`apiPath` / `articlePath` 若被填成指向别的主机的地址，扩展会**直接报错**而不是照发请求。这是有意的取舍。
 
 ---
 
@@ -305,19 +351,21 @@ CI（`.github/workflows/ci.yml`）只跑 `npm run verify` 与打包上传产物�
 ```
 wiki-user-preview/
 ├── src/
-│   ├── extension.ts              # 命令注册、主流程、会话缓存、错误处理
-│   ├── config.ts                 # 配置解析与回退链、站点探测、标题模板、URL 拼装
+│   ├── extension.ts              # 命令注册、主流程、会话与客户端缓存、错误处理
+│   ├── config.ts                 # 配置解析与回退链、站点探测、同源校验、标题模板、URL 拼装
 │   ├── mediawiki.ts              # tokens / login / clientlogin / edit / parse / purge / 限流重试
-│   ├── httpClient.ts             # 零依赖 HTTP 客户端：cookie jar、重定向、gzip/br 解压
-│   ├── pageInfo.ts               # PAGE_INFO 块的解析与剥离
-│   ├── preview.ts                # 三种预览方式 + HTML 净化 + 浏览器落位
-│   └── test/integration/         # 真机集成测试（@vscode/test-electron）
+│   ├── httpClient.ts             # 零依赖 HTTP 客户端：单向主机白名单、cookie jar、重定向、gzip/br
+│   ├── pageInfo.ts               # PAGE_INFO 块的解析与剥离（只认文件开头）
+│   ├── preview.ts                # 三种预览方式 + HTML 净化 + CSP + 浏览器落位
+│   └── test/integration/         # 真机集成测试（@vscode/test-electron），含端到端写入流程
 ├── scripts/
 │   ├── smoke.ts                  # 冒烟测试
+│   ├── fakeWiki.ts               # 本地假 MediaWiki（登录 / 编辑 / 解析 / 私有读取）与凭据收集端
 │   ├── vscode-stub.ts            # 让纯函数与决策逻辑能在 Node 里被测试的 vscode 替身
-│   ├── verify-bundle.cjs         # 打包产物校验
-│   ├── check-manifest.mjs        # package.json 与源码一致性校验
-│   └── run-integration.sh        # 集成测试环境包装
+│   ├── verify-bundle.cjs         # 打包产物校验（自带一份内联替身，改 API 时要同步）
+│   ├── check-manifest.mjs        # package.json 与源码、自述文件的一致性校验
+│   ├── runIntegration.mjs        # 集成测试装置：预写设置、隔离用户目录、注入端口
+│   └── run-integration.sh        # 无图形界面 Linux / WSL 下的环境包装
 ├── .github/workflows/ci.yml
 ├── esbuild.mjs
 └── package.json
