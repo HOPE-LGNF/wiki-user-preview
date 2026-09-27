@@ -87,10 +87,52 @@ for (const id of new Set(menuCommands)) {
 	}
 }
 
+// ---------------------------------------------------------------- README 配置表
+// README 里的配置表和 package.json 极易漂移（改了默认值忘了改文档、加了配置项没写文档）。
+console.log('\n[README 配置表]');
+const readme = readFileSync('README.md', 'utf8');
+
+// 形如：| `wikiUserPreview.site` | `""` | 说明 |
+const rows = [...readme.matchAll(/^\|\s*`(wikiUserPreview\.[A-Za-z0-9_.]+)`\s*\|\s*`([^`]*)`\s*\|/gm)].map(m => ({
+	key: m[1],
+	default: m[2].trim(),
+}));
+const documented = new Set(rows.map(r => r.key));
+
+const normalise = value => String(value).replace(/^"(.*)"$/s, '$1');
+
+for (const { key, default: docDefault } of rows) {
+	const actual = pkg.contributes.configuration.properties[key];
+	if (actual === undefined) {
+		fail(`README 文档了不存在的配置项：${key}`);
+		continue;
+	}
+	// 两侧都归一化：README 里空字符串写成 `""`，而 JSON.stringify('') 也是 '""'
+	if (normalise(JSON.stringify(actual.default)) !== normalise(docDefault)) {
+		fail(`README 的默认值与 package.json 不一致：${key} —— 文档写 ${JSON.stringify(docDefault)}，实际 ${JSON.stringify(actual.default)}`);
+	} else {
+		ok(`README 与 package.json 一致：${key} = ${JSON.stringify(actual.default)}`);
+	}
+}
+
+const undocumented = properties.filter(key => !documented.has(key));
+for (const key of undocumented) {
+	fail(`配置项没有写进 README 的配置表：${key}`);
+}
+if (undocumented.length === 0) {
+	ok(`全部 ${properties.length} 个配置项都在 README 里有条目`);
+}
+
 if (pkg.main !== './dist/extension.js') {
 	fail(`package.json 的 main 是 ${pkg.main}，与 esbuild 产物 dist/extension.js 不一致`);
 } else {
 	ok('main 指向 esbuild 产物 dist/extension.js');
+}
+
+if (pkg.repository?.url !== 'https://github.com/HOPE-LGNF/wiki-user-preview.git') {
+	fail(`package.json 的 repository 不正确：${pkg.repository?.url}`);
+} else {
+	ok('repository 指向 GitHub 仓库');
 }
 
 console.log(failed === 0 ? '\n清单一致性检查通过。' : `\n清单一致性检查失败：${failed} 项。`);
