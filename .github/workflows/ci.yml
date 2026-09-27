@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - run: npm ci
+
+      # 类型检查 + package.json 与源码的一致性 + 构建 + 打包产物校验。
+      # 刻意不跑 `npm run smoke`（它要联网打真实 MediaWiki，容易受限流影响），
+      # 也不跑 `npm run test:integration`（需要 GUI）。
+      - run: npm run verify
+
+      - run: npx @vscode/vsce package --no-dependencies --allow-missing-repository
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vsix
+          path: '*.vsix'

@@ -1,0 +1,286 @@
+{
+  "name": "wiki-user-preview",
+  "displayName": "Wiki User Preview",
+  "description": "Upload the current file to a page under your wiki User namespace, save it, and preview the rendered original page in VS Code.",
+  "version": "0.2.3",
+  "publisher": "UnauthorizedHOPE",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "keywords": [
+    "mediawiki",
+    "wikitext",
+    "preview",
+    "user page",
+    "huijiwiki"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/HOPE-LGNF/wiki-user-preview.git"
+  },
+  "bugs": {
+    "url": "https://github.com/HOPE-LGNF/wiki-user-preview/issues"
+  },
+  "homepage": "https://github.com/HOPE-LGNF/wiki-user-preview#readme",
+  "main": "./dist/extension.js",
+  "activationEvents": [],
+  "contributes": {
+    "commands": [
+      {
+        "command": "wikiUserPreview.originalPreview",
+        "title": "Original Preview：写入用户页并预览",
+        "category": "Wiki User Preview",
+        "icon": "$(open-preview)"
+      },
+      {
+        "command": "wikiUserPreview.login",
+        "title": "登录（并显示当前账号）",
+        "category": "Wiki User Preview"
+      },
+      {
+        "command": "wikiUserPreview.logout",
+        "title": "退出登录",
+        "category": "Wiki User Preview"
+      },
+      {
+        "command": "wikiUserPreview.setPassword",
+        "title": "设置密码（存入系统钥匙串）",
+        "category": "Wiki User Preview"
+      },
+      {
+        "command": "wikiUserPreview.clearPassword",
+        "title": "清除已保存的密码",
+        "category": "Wiki User Preview"
+      },
+      {
+        "command": "wikiUserPreview.showResolvedConfig",
+        "title": "显示生效的配置（诊断）",
+        "category": "Wiki User Preview"
+      }
+    ],
+    "menus": {
+      "editor/title": [
+        {
+          "command": "wikiUserPreview.originalPreview",
+          "when": "editorLangId == wikitext",
+          "group": "navigation@9"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "wikiUserPreview.originalPreview",
+          "when": "editorLangId == wikitext"
+        },
+        {
+          "command": "wikiUserPreview.login"
+        },
+        {
+          "command": "wikiUserPreview.logout"
+        },
+        {
+          "command": "wikiUserPreview.setPassword"
+        },
+        {
+          "command": "wikiUserPreview.clearPassword"
+        },
+        {
+          "command": "wikiUserPreview.showResolvedConfig"
+        }
+      ]
+    },
+    "keybindings": [
+      {
+        "command": "wikiUserPreview.originalPreview",
+        "key": "ctrl+alt+p",
+        "mac": "cmd+alt+p",
+        "when": "editorLangId == wikitext"
+      }
+    ],
+    "configuration": {
+      "title": "Wiki User Preview",
+      "properties": {
+        "wikiUserPreview.site": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "站点地址。可以是完整 URL（`https://www.huijiwiki.com`）、也可以是裸域名（`www.huijiwiki.com`，灰机wiki 主站）。留空时回退到 Wikitext 扩展的 `#wikitext.host#` / `#wikitext.transferProtocol#`。"
+        },
+        "wikiUserPreview.apiPath": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "`api.php` 的路径。留空时依次尝试 `wikitext.apiPath`、`/api.php`、`/w/api.php` 自动探测。灰机wiki（HuijiWiki）请用 `/api.php`。"
+        },
+        "wikiUserPreview.articlePath": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "条目的路径前缀，例如 `/wiki/` 或 `/index.php?title=$1`。留空时回退到 `#wikitext.articlePath#`，再不行就用 `/wiki/`。"
+        },
+        "wikiUserPreview.username": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "登录用户名。留空时依次回退到 `#wikitext.userName#`，以及从 `#wikiparser.user#` 中的用户页 URL 解析。如果使用机器人密码，请写成 `用户名@机器人名`。"
+        },
+        "wikiUserPreview.useWikitextSettings": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "允许在自身配置留空时，复用 Wikitext 扩展（`RoweWilsonFrederiskHolme.wikitext`）的站点与账号配置。"
+        },
+        "wikiUserPreview.loginMode": {
+          "type": "string",
+          "default": "auto",
+          "enum": [
+            "auto",
+            "botPassword",
+            "clientlogin"
+          ],
+          "enumDescriptions": [
+            "先试 action=login（机器人密码），失败再回退到 action=clientlogin（主账号密码，可能出现两步验证）",
+            "只用 action=login，需要 Special:BotPasswords 生成的机器人密码",
+            "只用 action=clientlogin，使用主账号密码"
+          ],
+          "markdownDescription": "登录方式。MediaWiki 官方建议用机器人密码 + `action=login`；主账号密码必须走 `action=clientlogin`。"
+        },
+        "wikiUserPreview.targetFromPageInfo": {
+          "type": "string",
+          "default": "userNamespaceOnly",
+          "enum": [
+            "userNamespaceOnly",
+            "always",
+            "never"
+          ],
+          "enumDescriptions": [
+            "只有当 PAGE_INFO.pageTitle 位于 User 命名空间时才写回该页面（安全默认）",
+            "只要 PAGE_INFO 有 pageTitle 就写回它，等同于 Wikitext 的 Post your edit 语义",
+            "忽略 pageTitle，始终用 wikitext.pageTemplate 生成目标页面"
+          ],
+          "markdownDescription": "Wikitext 扩展的「Pull page to edit」会在文件开头写入 `PAGE_INFO` 块（含 `pageTitle`）。开启后该标题会决定写回哪个页面，从而形成「拉取 → 编辑 → 预览」的往返。`always` 模式下如果你 pull 的是主命名空间条目，就会直接编辑那个条目，请自行确认权限。"
+        },
+        "wikiUserPreview.pageTemplate": {
+          "type": "string",
+          "default": "User:{username}/OriginalPreview/{filename}",
+          "markdownDescription": "目标页面标题模板，仅在没能从 `PAGE_INFO.pageTitle` 得到目标页面时使用。可用变量：`{username}`、`{filename}`（不含扩展名的文件名）、`{ext}`、`{basename}`（含扩展名）、`{subpage}`（子页面名，见下）。例如固定单页可设为 `User:{username}/OriginalPreview`。"
+        },
+        "wikiUserPreview.subpage": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "`{subpage}` 变量的值。留空时使用当前文件名（不含扩展名）。"
+        },
+        "wikiUserPreview.summaryTemplate": {
+          "type": "string",
+          "default": "由 VS Code 扩展 Wiki User Preview 上传，源文件：{basename}",
+          "markdownDescription": "编辑摘要模板，可用变量同 `#wikiUserPreview.pageTemplate#`。"
+        },
+        "wikiUserPreview.previewMode": {
+          "type": "string",
+          "default": "webview",
+          "enum": [
+            "webview",
+            "simpleBrowser",
+            "external",
+            "ask"
+          ],
+          "enumDescriptions": [
+            "Webview 内渲染 action=parse 的结果（无 iframe、不执行站点脚本），固定在当前代码区右侧打开。最稳，但没有站点皮肤",
+            "VS Code 内置 Simple Browser（真·原页面含皮肤）。两个已知问题：① 内嵌页面触发通知时 VS Code 会暂停它并显示「因通知而暂停」；② iframe 里站点的 cookie 属第三方会被拦，站点若禁止嵌套则显示空白",
+            "系统默认浏览器",
+            "每次询问"
+          ],
+          "markdownDescription": "保存成功后用什么方式打开页面。默认 `webview`，因为它在任何站点上都不会被 iframe 策略或站点脚本干扰；想要完整的站点外观就改用 `simpleBrowser` 或 `external`。保存成功后提示条上始终有一键切换的按钮。"
+        },
+        "wikiUserPreview.enableScripts": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "`webview` 预览模式下注入一个链接跳转脚本，让页面内的链接改为在系统浏览器打开。站点自带的 JS 在任何情况下都会被剥离。默认关闭（关闭时链接会在 webview 内跳转，可能被站点的 iframe 保护拦住）。"
+        },
+        "wikiUserPreview.getCss": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "`webview` 模式下额外请求站点 CSS（`prop=headhtml`）。站点皮肤类样式不会完全生效。"
+        },
+        "wikiUserPreview.watchlist": {
+          "type": "string",
+          "default": "nochange",
+          "enum": [
+            "nochange",
+            "watch",
+            "unwatch",
+            "preferences"
+          ],
+          "markdownDescription": "保存时对监视列表的处理方式。"
+        },
+        "wikiUserPreview.minorEdit": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "是否标记为小编辑。"
+        },
+        "wikiUserPreview.confirmBeforeSave": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "写入前弹窗确认目标页面与字符数。"
+        },
+        "wikiUserPreview.detectConflict": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "写入时带上 `baserevid` 做编辑冲突检测，冲突时询问是否强制覆盖。"
+        },
+        "wikiUserPreview.purgeAfterSave": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "写入成功后调一次 `action=purge` 刷新该页缓存。编辑本身会刷新 MediaWiki 的解析缓存，但 Cloudflare 之类的边缘缓存不一定跟着失效，那会导致打开页面看到旧版本。失败只记日志，不影响主流程。"
+        },
+        "wikiUserPreview.simpleBrowserBeside": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "让**内置浏览器**不与代码挤在同一编辑器组，而是出现在代码区右侧。原因：VS Code 1.9x 起，只要工作台里有 `workbench.action.browser.open`（集成浏览器），内置 simple-browser 就会把请求整个转交过去，而那条路径**总是开在当前组**、而且收不到 `viewColumn`；老式 Simple Browser 又不受 `ViewColumn.Beside` 影响。因此本扩展统一在打开后把浏览器标签移到右侧组（`workbench.action.moveEditorToRightGroup`）。判据是「这一组里有没有代码文件」，所以连续预览不会越切越多组。只在 `previewMode` 为 `simpleBrowser` 时生效；`webview` 模式本来就是右侧分栏。"
+        },
+        "wikiUserPreview.openAfterSave": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "保存成功后自动打开页面。"
+        },
+        "wikiUserPreview.userAgent": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "自定义 User-Agent。留空时使用浏览器风格 UA 并附带 `#wikiparser.user#` 里的联系方式（满足 WMF 的 UA 政策）。若站点被 Cloudflare 拦，保持默认或填浏览器 UA 通常更容易通过。"
+        },
+        "wikiUserPreview.requestTimeout": {
+          "type": "number",
+          "default": 30000,
+          "description": "单次 HTTP 请求超时（毫秒）。"
+        },
+        "wikiUserPreview.insecureTls": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "跳过 TLS 证书校验。仅在自建站点使用自签名证书时开启。"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "node esbuild.mjs",
+    "watch": "node esbuild.mjs --watch",
+    "typecheck": "tsc --noEmit",
+    "check:manifest": "node scripts/check-manifest.mjs",
+    "verify": "npm run typecheck && npm run check:manifest && node esbuild.mjs && node scripts/verify-bundle.cjs",
+    "verify:dist": "node esbuild.mjs --production && node scripts/verify-bundle.cjs",
+    "bundle:test": "esbuild src/test/integration/index.ts src/test/integration/preview.test.ts --bundle --platform=node --format=cjs --external:vscode --external:mocha --outdir=out-test/integration --out-extension:.js=.cjs",
+    "test:integration": "npm run bundle:test && bash scripts/run-integration.sh",
+    "smoke:build": "esbuild scripts/smoke.ts --bundle --platform=node --format=cjs --target=node18 --alias:vscode=./scripts/vscode-stub.ts --outfile=out/smoke.cjs --log-level=warning",
+    "smoke": "npm run smoke:build && node out/smoke.cjs",
+    "vscode:prepublish": "node esbuild.mjs --production",
+    "package": "vsce package --no-dependencies"
+  },
+  "devDependencies": {
+    "@types/mocha": "^10.0.10",
+    "@types/node": "^20.14.0",
+    "@types/vscode": "^1.85.0",
+    "@vscode/test-electron": "^3.1.0",
+    "@vscode/vsce": "^3.2.1",
+    "esbuild": "^0.24.0",
+    "mocha": "^12.0.2",
+    "typescript": "^5.5.0"
+  }
+}

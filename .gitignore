@@ -1,0 +1,8 @@
+*.vsix
+.vscode-test/
+dist/
+integration-run.log
+node_modules/
+out-test/
+out/
+tmp-test-workspace/
