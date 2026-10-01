@@ -185,6 +185,48 @@ eq('lua 模型的 --[=[ ]=] 包裹也能剥离', extractPageInfo('--[=[<%-- [PAG
 // 空字段（##）必须视为不存在，否则会把空串当成页面标题/版本号发出去
 check('空字段 ## 视为不存在', extractPageInfo('<%-- [PAGE_INFO]\n    revisionID = ##\n[END_PAGE_INFO] --%>\r\rbody').info?.revisionID === undefined);
 
+// ------- 真实站点样本（casualtiesunknown.huijiwiki.com，从磁盘上已 pull 的文件里摘取）-------
+// 上面的用例是按 Wikitext 源码构造的；这几条是站点真实产出的原文，用来确认「只认文件开头」
+// 这条改动不会误伤真实文件，也确认两种包裹形态都还在。
+const realWikitextPull =
+	'<%-- [PAGE_INFO]\n' +
+	'    comment = #Please do not remove this struct.#\n' +
+	'    pageTitle = #建筑#\n' +
+	'    pageID = ##\n' +
+	'    revisionID = ##\n' +
+	'    contentModel = ##\n' +
+	'    contentFormat = ##\n' +
+	'[END_PAGE_INFO] --%>\n' +
+	'\n' +
+	"{{正在施工|user=Unauthorized HOPE}}\n'''建筑'''是[[角色]]在地图中遇到的可交互实体。\n";
+const realWikitest = extractPageInfo(realWikitextPull);
+check('真实样本(wikitext)：开头的块被剥离', realWikitest.block !== undefined && realWikitest.block.start === 0, realWikitest.block);
+eq('真实样本(wikitext)：pageTitle 解析正确', realWikitest.info?.pageTitle, '建筑');
+check('真实样本(wikitext)：空 pageID/revisionID 不产生假值', realWikitest.info?.pageID === undefined && realWikitest.info?.revisionID === undefined, realWikitest.info);
+check('真实样本(wikitext)：正文完整保留且不含 PAGE_INFO', realWikitest.content.includes("'''建筑'''") && !realWikitest.content.includes('PAGE_INFO'), realWikitest.content.slice(0, 30));
+check('真实样本(wikitext)：剥离掉的块后紧跟的空白行也被去掉', realWikitest.content.startsWith('{{正在施工'), JSON.stringify(realWikitest.content.slice(0, 12)));
+
+const realLuaPull =
+	'--[=[<%-- [PAGE_INFO]\n' +
+	'    comment = #Please do not remove this struct.#\n' +
+	'    pageTitle = #模块:实体/信息框#\n' +
+	'    pageID = #2085#\n' +
+	'    revisionID = #12586#\n' +
+	'    contentModel = #Scribunto#\n' +
+	'    contentFormat = #text/plain#\n' +
+	'[END_PAGE_INFO] --%>--]=]\n' +
+	'\n' +
+	'local p = {}\n';
+const realLua = extractPageInfo(realLuaPull);
+eq('真实样本(lua)：pageTitle 解析正确（含命名空间与斜杠）', realLua.info?.pageTitle, '模块:实体/信息框');
+eq('真实样本(lua)：revisionID 解析正确', realLua.info?.revisionID, '12586');
+eq('真实样本(lua)：contentModel 解析正确', realLua.info?.contentModel, 'Scribunto');
+eq('真实样本(lua)：正文完整保留', realLua.content, 'local p = {}\n');
+
+// 真实样本里有「块后面没有正文」的文件；剥完为空必须让调用方能够拒绝上传
+const emptyAfterStrip = extractPageInfo('<%-- [PAGE_INFO]\n    pageTitle = #模块:建筑/Base/分类#\n    revisionID = #14441#\n[END_PAGE_INFO] --%>\n');
+check('真实样本：纯元信息文件剥完为空', emptyAfterStrip.block !== undefined && emptyAfterStrip.content.trim() === '', JSON.stringify(emptyAfterStrip.content));
+
 // 目标页面是否属于 User 命名空间（决定要不要写回 PAGE_INFO 的标题）
 eq('isUserNamespaceTitle: User:', isUserNamespaceTitle('User:Foo'), true);
 eq('isUserNamespaceTitle: 用户:', isUserNamespaceTitle('用户:Foo/bar'), true);
