@@ -284,20 +284,29 @@ async function probe(client: WikiHttpClient): Promise<string | undefined> {
 }
 
 async function main(): Promise<void> {
-	// batch-grab.mjs 是 ESM，而本文件编译成 CJS，静态 import 会被 tsc 拒绝（TS1479）。
-	// 动态 import 既能通过类型检查，esbuild 打包时也会把它内联进来。
-	const { pageInfoHead } = await import('./batch-grab.mjs');
-
-// ------- 批量导出工具（scripts/batch-grab.mjs）产出的文件必须能被本扩展解析 -------
-// 这是「导出 → 改 → 推回」这条链路的关键：如果导出的 PAGE_INFO 头解析不出来，
-// 推回时就会把整块当正文上传，或者丢失冲突基准。
-const grabbedLua = `${pageInfoHead({ title: '模块:实体/信息框', pageid: 2085, revid: 12586, contentModel: 'Scribunto', contentFormat: 'text/plain' })}\n\nlocal p = {}\n`;
-const reparse = extractPageInfo(grabbedLua);
-check('批量导出：PAGE_INFO 头可被剥离', reparse.block !== undefined, reparse.block);
-eq('批量导出：目标页面可恢复', reparse.info?.pageTitle, '模块:实体/信息框');
-eq('批量导出：冲突基准版本可恢复', reparse.info?.revisionID, '12586');
-eq('批量导出：内容模型可恢复', reparse.info?.contentModel, 'Scribunto');
-eq('批量导出：正文完整保留', reparse.content, 'local p = {}\n');
+	// ------- 与 wiki-batch-grab 的契约：那个工具导出的文件必须能被本扩展解析 -------
+	// 这里的字节与 https://github.com/HOPE-LGNF/wiki-batch-grab 的测试断言**完全一致**。
+	// 两边各守自己那一侧：那边断言「产出的就是这些字节」，这边断言「能解析这些字节」。
+	// 契约靠固定样本 + 文档维持 —— 刻意不 import 对方，否则一个爬虫脚本能拖挂本仓库的 CI。
+	const grabbedLua = [
+		'<%-- [PAGE_INFO]',
+		"    comment = #Please do not remove this struct. It's record contains some important information of edit. This struct will be removed automatically after you push edits.#",
+		'    pageTitle = #模块:实体/信息框#',
+		'    pageID = #2001#',
+		'    revisionID = #15001#',
+		'    contentModel = #Scribunto#',
+		'    contentFormat = #text/plain#',
+		'[END_PAGE_INFO] --%>',
+		'',
+		'local p = {}',
+		'',
+	].join('\n');
+	const reparse = extractPageInfo(grabbedLua);
+	check('外部工具导出的文件：PAGE_INFO 头可被剥离', reparse.block !== undefined, reparse.block);
+	eq('外部工具导出的文件：目标页面可恢复', reparse.info?.pageTitle, '模块:实体/信息框');
+	eq('外部工具导出的文件：冲突基准版本可恢复', reparse.info?.revisionID, '15001');
+	eq('外部工具导出的文件：内容模型可恢复', reparse.info?.contentModel, 'Scribunto');
+	eq('外部工具导出的文件：正文完整保留', reparse.content, 'local p = {}\n');
 
 	// ---- 预览打开位置：必须用 simpleBrowser.api.open 才能指定列（回归用户反馈）----
 	// 这段放 main() 里是因为要用 await；smoke 打包成 CJS，不支持顶层 await。

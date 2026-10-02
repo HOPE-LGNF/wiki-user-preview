@@ -286,43 +286,17 @@ HTTP 客户端持有唯一被授权的主机，每次请求（包括每一次重
 
 ---
 
-## 批量导出页面（附带脚本）
+## 相关的独立工具
 
-Wikitext 只有单页的「Pull page to edit」。要一次拿回几十上百页，用仓库里的
-`scripts/batch-grab.mjs`：零依赖、单文件，可直接拷到别处运行。
+批量把页面源码抓成本地文件，用独立仓库 [wiki-batch-grab](https://github.com/HOPE-LGNF/wiki-batch-grab)：
 
 ```bash
-# 先看要抓哪些（不发内容请求）
-node scripts/batch-grab.mjs --site <你的站点> --prefix "模块:建筑/" --dry-run
-
-# 真正导出
-node scripts/batch-grab.mjs --site <你的站点> --prefix "模块:建筑/" --out ./wiki-export
-
-# 也可以混合多个来源
-node scripts/batch-grab.mjs --site <你的站点> --category "分类:角色" --file 额外标题.txt --out ./wiki-export
+node batch-grab.mjs --site <你的站点> --prefix "模块:建筑/" --out ./wiki-export
 ```
 
-**它必须跑在能访问该站点的网络里**——它是个普通的 Node 脚本，不在 VS Code 里运行，
-也不走扩展宿主。站点在 Cloudflare 后面时，数据中心 IP 或非常规客户端可能被质询，
-此时在你自己机器上跑才有意义。
+它导出的文件默认带 `PAGE_INFO` 头，格式与本扩展（以及 Wikitext）写的完全一致，因此抓下来改完可以直接推回。
 
-| 参数 | 作用 |
-|---|---|
-| `--site <host>` | 必填，例如 `www.huijiwiki.com` |
-| `--api-path <p>` | 默认 `/api.php`；注意维基百科是 `/w/api.php` |
-| `--ua <string>` | User-Agent。被 Cloudflare 质询时可以填浏览器的 UA |
-| `--pages` / `--file` / `--prefix` / `--category` / `--all` | 页面来源，可叠加，取并集 |
-| `--out <dir>` | 输出目录，默认 `./wiki-export` |
-| `--name-style` | `dash`（默认）把 `:` 与 `/` 换成 `_`，平铺；`raw` 保留 `/`，按子页面分目录 |
-| `--no-page-info` | 不写 `PAGE_INFO` 头，只要纯源码 |
-| `--overwrite` | 覆盖已存在的文件；默认跳过，便于中断后续跑 |
-| `--batch` / `--delay` | 每次请求合并的标题数（默认 20，上限 50）与请求间隔（默认 300ms） |
-| `--dry-run` | 只列出将要导出的页面，不请求内容、不写文件 |
-
-导出的文件默认带 `PAGE_INFO` 头，格式与 Wikitext 写入的完全一致，因此**改完可以直接用
-Wikitext 的「Post your edit to the website」推回去**——它从头部读取目标页面与冲突基准，
-并在推送前把整块剥掉。冒烟测试里有一条断言专门守着这个契约（导出 → 本扩展的解析器必须
-能剥掉并还原出标题、版本与正文）。
+两者之间**只有这个数据格式契约**，各自用固定样本断言守着，不共享代码：本扩展的职责是「把当前文件写到用户页并预览」，批量抓取是另一件事——方向（写/读）、粒度（单页/成批）、运行环境（扩展宿主/命令行）都不同。放进同一个仓库，只会让一个爬虫脚本的测试拖挂本扩展的 CI。
 
 ---
 
@@ -349,7 +323,6 @@ npm run test:integration # 真机集成测试（需图形界面）
 | `npm run typecheck` | 类型检查（`src/` 与 `scripts/` 都在内，测试脚本不过类型检查很容易掩盖错误） | 无 |
 | `npm run check:manifest` | `package.json` 与源码的一致性：声明的命令是否都注册了、配置项是否都真的被读取、`#xxx#` 内链是否指向存在的配置项、自述文件的配置表是否与 `package.json` 一致、`main` 是否指向构建产物 | 无 |
 | `scripts/verify-bundle.cjs` | 把 `vscode` 替换成替身后**真正 require 打包产物并调用 `activate()`**，断言命令注册、订阅是否都可回收 | 无 |
-| `npm run test:batch` | 11 项断言：批量导出工具的文件名映射、`PAGE_INFO` 头格式、分批请求、整批失败后逐条重试、续跑跳过、`--dry-run` 不发内容请求、API/HTTP 错误处理 | 无 |
 | `npm run smoke` | 129 项断言。纯函数（标题模板、`PAGE_INFO` 定位、URL 拼装、头部净化、预览 HTML 与 CSP）+ **本地假 MediaWiki** 上的凭据边界、跳转限制、两步验证续登、会话与登出、主机白名单 + 对真实 MediaWiki 的匿名只读调用（含 429 退避） | 部分联网 |
 | `npm run test:integration` | 7 项断言：在真实 VS Code 的扩展宿主里验证编辑器分组与标签落位、revid 校验，以及**完整的写入流程**（用本地假 wiki 跑通登录 → 编辑 → 撤缓存 → 预览） | 图形界面 + 首次会下载 VS Code |
 
@@ -400,9 +373,6 @@ wiki-user-preview/
 │   ├── preview.ts                # 三种预览方式 + HTML 净化 + CSP + 浏览器落位
 │   └── test/integration/         # 真机集成测试（@vscode/test-electron），含端到端写入流程
 ├── scripts/
-│   ├── batch-grab.mjs            # 批量导出页面源码的独立工具（零依赖，可直接拷走）
-│   ├── batch-grab.d.mts          # 上面那个纯 JS 工具的类型声明（供仓库内调用方使用）
-│   ├── batch-grab.test.mjs       # 它的离线测试（node:test，假 API + 真实 HTTP 服务器）
 │   ├── smoke.ts                  # 冒烟测试
 │   ├── fakeWiki.ts               # 本地假 MediaWiki（登录 / 编辑 / 解析 / 私有读取）与凭据收集端
 │   ├── vscode-stub.ts            # 让纯函数与决策逻辑能在 Node 里被测试的 vscode 替身
