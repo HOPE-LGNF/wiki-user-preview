@@ -285,14 +285,15 @@
     "watch": "node esbuild.mjs --watch",
     "typecheck": "tsc --noEmit",
     "check:manifest": "node scripts/check-manifest.mjs",
-    "verify": "npm run typecheck && npm run check:manifest && node esbuild.mjs && node scripts/verify-bundle.cjs",
+    "verify": "npm run typecheck && npm run check:manifest && npm run test:batch && node esbuild.mjs && node scripts/verify-bundle.cjs",
     "verify:dist": "node esbuild.mjs --production && node scripts/verify-bundle.cjs",
     "bundle:test": "esbuild src/test/integration/index.ts src/test/integration/preview.test.ts --bundle --platform=node --format=cjs --external:vscode --external:mocha --outdir=out-test/integration --out-extension:.js=.cjs",
     "test:integration": "node esbuild.mjs && node scripts/verify-bundle.cjs && npm run bundle:test && bash scripts/run-integration.sh",
     "smoke:build": "esbuild scripts/smoke.ts --bundle --platform=node --format=cjs --target=node18 --alias:vscode=./scripts/vscode-stub.ts --outfile=out/smoke.cjs --log-level=warning",
     "smoke": "npm run smoke:build && node out/smoke.cjs",
     "vscode:prepublish": "node esbuild.mjs --production",
-    "package": "vsce package --no-dependencies"
+    "package": "vsce package --no-dependencies",
+    "test:batch": "node --test scripts/batch-grab.test.mjs"
   },
   "devDependencies": {
     "@types/mocha": "^10.0.10",

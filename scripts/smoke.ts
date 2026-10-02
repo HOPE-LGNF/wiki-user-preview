@@ -142,6 +142,7 @@ const strippedDialog = writeConfirm({ ...baseConfirm, openAfterwards: true, stri
 check('确认框：剥离了 PAGE_INFO 时在明细里说明', strippedDialog.detail.includes('42 字符不会上传'), strippedDialog.detail);
 check('确认框：没有剥离时不出现该说明', !previewDialog.detail.includes('PAGE_INFO'), previewDialog.detail);
 
+
 // -------- PAGE_INFO：wikitext 的「Pull page to edit」必然在文件开头插入这个块 --------
 // 下面的字符串按 wikitext 的 getPageCode/getInfoHead 真实格式构造：字段之间用 \r 分隔，
 // 且 wikitext 内容模型用的注释符是空串，所以这个块本身并不是注释。
@@ -283,6 +284,21 @@ async function probe(client: WikiHttpClient): Promise<string | undefined> {
 }
 
 async function main(): Promise<void> {
+	// batch-grab.mjs 是 ESM，而本文件编译成 CJS，静态 import 会被 tsc 拒绝（TS1479）。
+	// 动态 import 既能通过类型检查，esbuild 打包时也会把它内联进来。
+	const { pageInfoHead } = await import('./batch-grab.mjs');
+
+// ------- 批量导出工具（scripts/batch-grab.mjs）产出的文件必须能被本扩展解析 -------
+// 这是「导出 → 改 → 推回」这条链路的关键：如果导出的 PAGE_INFO 头解析不出来，
+// 推回时就会把整块当正文上传，或者丢失冲突基准。
+const grabbedLua = `${pageInfoHead({ title: '模块:实体/信息框', pageid: 2085, revid: 12586, contentModel: 'Scribunto', contentFormat: 'text/plain' })}\n\nlocal p = {}\n`;
+const reparse = extractPageInfo(grabbedLua);
+check('批量导出：PAGE_INFO 头可被剥离', reparse.block !== undefined, reparse.block);
+eq('批量导出：目标页面可恢复', reparse.info?.pageTitle, '模块:实体/信息框');
+eq('批量导出：冲突基准版本可恢复', reparse.info?.revisionID, '12586');
+eq('批量导出：内容模型可恢复', reparse.info?.contentModel, 'Scribunto');
+eq('批量导出：正文完整保留', reparse.content, 'local p = {}\n');
+
 	// ---- 预览打开位置：必须用 simpleBrowser.api.open 才能指定列（回归用户反馈）----
 	// 这段放 main() 里是因为要用 await；smoke 打包成 CJS，不支持顶层 await。
 	console.log('\n[1b] 预览打开位置（不需要联网）');
